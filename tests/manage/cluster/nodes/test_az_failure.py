@@ -6,6 +6,7 @@ import pytest
 from ocs_ci.framework.pytest_customization.marks import aws_platform_required
 from ocs_ci.framework.testlib import ManageTest, tier4, bugzilla
 from ocs_ci.ocs.exceptions import CommandFailed
+from ocs_ci.ocs.resources.pod import get_mon_pods
 from tests import sanity_helpers
 
 logger = logging.getLogger(__name__)
@@ -146,6 +147,14 @@ class TestAvailabilityZones(ManageTest):
         return security_group_id
 
     def check_cluster_health(self):
+        """
+        Check if cluster is healthy, without failing the whole test if
+        this test failed
+
+        Returns: bool: True if healthy
+            False if cluster is not healthy, and return CommandFailed exception
+
+        """
         try:
             self.sanity_helpers.health_check()
             return True
@@ -153,3 +162,15 @@ class TestAvailabilityZones(ManageTest):
             if "Unable to connect to the server" in str(e):
                 logger.warning(f"{e}, Cluster is not healthy")
                 return False
+
+    def get_amount_of_monitors(self):
+        """
+        Gets amount of monitor pods
+
+        Returns:
+            int: number of monitor pods
+
+        """
+        mons_set = set(get_mon_pods())
+
+        return len(mons_set)

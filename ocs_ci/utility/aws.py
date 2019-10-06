@@ -168,6 +168,25 @@ class AWS(object):
 
         return instance.placement.get('AvailabilityZone')
 
+    def get_amount_of_az_in_deployment(self, instances_id):
+        """
+        Return amount of availability zones in current deployment
+
+        Args:
+            instances_id (list): ec2 instance_id
+
+        Returns:
+            int: Amount of availability zone used by current deployment
+
+        """
+        az_list = list()
+        for instance_id in instances_id:
+            az_list.append(self.get_availability_zone_id_by_instance_id(instance_id))
+
+        set(az_list)
+
+        return len(az_list)
+
     def create_volume(
         self,
         availability_zone,
