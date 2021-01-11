@@ -1,0 +1,19 @@
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: csirbd-fio-pod
+  namespace: openshift-storage
+spec:
+  containers:
+    - name: fio-master
+      image: quay.io/cloud-bulldozer/fio:master
+      command: ["/bin/bash", "-ce", "tail -f /dev/null", "tty: true"]
+      volumeMounts:
+        - name: mypvc
+          mountPath: /var/lib/www/html
+  volumes:
+    - name: mypvc
+      persistentVolumeClaim:
+        claimName: fio-pvc
+        readOnly: false
