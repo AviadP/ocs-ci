@@ -666,8 +666,10 @@ def login_ui(console_url=None):
         driver (Selenium WebDriver)
 
     """
+    default_console = False
     if not console_url:
         console_url = get_ocp_url()
+        default_console = True
     logger.info("Get password of OCP console")
     password = get_kubeadmin_password()
     password = password.rstrip()
@@ -689,7 +691,8 @@ def login_ui(console_url=None):
             capabilities["acceptInsecureCerts"] = True
 
         # headless browsers are web browsers without a GUI
-        headless = ocsci_config.UI_SELENIUM.get("headless")
+        # headless = ocsci_config.UI_SELENIUM.get("headless")
+        headless = False
         if headless:
             chrome_options.add_argument("--headless")
             chrome_options.add_argument("window-size=1920,1400")
@@ -777,7 +780,8 @@ def login_ui(console_url=None):
         )
     )
     element.click()
-    WebDriverWait(driver, 60).until(ec.title_is(login_loc["ocp_page"]))
+    if default_console:
+        WebDriverWait(driver, 60).until(ec.title_is(login_loc["ocp_page"]))
     return driver
 
 
