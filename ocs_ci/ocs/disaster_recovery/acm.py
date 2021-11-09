@@ -124,22 +124,15 @@ class AcmAddClusters(AcmPageNavigator):
         self.do_send_keys(
             self.page_nav["Import_cluster_enter_name"], text="Cluster-One"
         )
+        time.sleep(3)
+        self.do_click(self.page_nav["Import_mode"])
+        # visibility = Select(self.driver.find_element_by_css_selector('button[class="pf-c-select__toggle"]'))
+        log.info("PASS STEP 1")
+        time.sleep(3)
+        self.do_click(self.page_nav["choose_kubeconfig"])
         time.sleep(10)
-        self.navigate_welcome_page()
-        time.sleep(3)
-        self.navigate_overview_page()
-        time.sleep(3)
-        self.navigate_bare_metal_assets_page()
-        time.sleep(3)
-        self.navigate_automation_page()
-        time.sleep(3)
-        self.navigate_infrastructure_env_page()
-        time.sleep(3)
-        self.navigate_applications_page()
-        time.sleep(3)
-        self.navigate_governance_page()
-        time.sleep(3)
-        self.navigate_credentials_page()
+
+        # visibility.select_by_value("2")
 
 
 def verify_running_acm():

@@ -364,6 +364,8 @@ acm_page_nav = {
     "Credentials": ("Credentials", By.LINK_TEXT),
     "Import_cluster": ("importCluster", By.ID),
     "Import_cluster_enter_name": ("clusterName", By.ID),
+    "Import_mode": ('button[class="pf-c-select__toggle"]', By.CSS_SELECTOR),
+    "choose_kubeconfig": ("//button[text()='Kubeconfig']", By.XPATH),
 }
 
 add_capacity = {
@@ -564,7 +566,6 @@ locators = {
         "page": page_nav,
         "deployment": {**deployment, **deployment_4_7, **deployment_4_9},
         "generic": generic_locators,
-
         "validation": {**validation, **validation_4_8, **validation_4_9},
         "acm_page": acm_page_nav,
     },
