@@ -79,6 +79,14 @@ class AcmAddClusters(AcmPageNavigator):
             else:
                 log.error(f"import of cluster: {cluster_name} failed")
 
+    def install_submariner_ui(self):
+        self.navigate_clusters_page()
+        self.do_click(locator=self.acm_page_nav["Clusters_page"])
+        log.info("Click on Cluster sets")
+        self.do_click(self.page_nav["cluster-sets"])
+        log.info("Click on Create cluster set")
+        self.do_click(self.page_nav["create-cluster-set"])
+
 
 def copy_kubeconfig(file):
     """
@@ -240,3 +248,10 @@ def import_clusters_with_acm():
         cluster_name=cluster_name_b,
         kubeconfig_location=kubeconfig_b,
     )
+
+
+def test_submariner():
+    verify_running_acm()
+    driver = login_to_acm()
+    acm_nav = AcmAddClusters(driver)
+    acm_nav.install_submariner_ui()

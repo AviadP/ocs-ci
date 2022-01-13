@@ -384,6 +384,23 @@ acm_page_nav = {
     "choose_kubeconfig": ("//button[text()='Kubeconfig']", By.XPATH),
     "Kubeconfig_text": ('textarea[label="Kubeconfig"]', By.CSS_SELECTOR),
     "Submit_import": ("//button[text()='Import']", By.XPATH),
+    "cluster-sets": ("//a[normalize-space()='Cluster sets']", By.XPATH),
+    "create-cluster-set": (".pf-c-button.pf-m-primary", By.CSS_SELECTOR),
+    "cluster-set-name": (
+        "input[placeholder='Enter cluster set name']",
+        By.CSS_SELECTOR,
+    ),
+    "click-create": ("button[type='submit']", By.CSS_SELECTOR),
+    "click-manage-resource-assignments": (
+        "//button[normalize-space()='Manage resource assignments']",
+        By.XPATH,
+    ),
+    "select-all-assignments": ("input[aria-label='Select all']", By.CSS_SELECTOR),
+    "click-local-cluster": (
+        "//*[@data-ouia-component-type='PF4/TableRow']//td[2]//*[text()='local-cluster']",
+        By.XPATH,
+    ),
+    "search-cluster": ("//input[@placeholder='Search']", By.XPATH),
 }
 
 add_capacity = {
@@ -601,6 +618,7 @@ locators = {
     "4.10": {
         "login": login,
         "page": page_nav,
+        "acm_page": acm_page_nav,
         "generic": generic_locators,
         "deployment": {
             **deployment,
