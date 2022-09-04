@@ -332,7 +332,7 @@ class OCSUpgrade(object):
             config.REPORTING["ocs_must_gather_image"] = must_gather_image
             config.REPORTING["ocs_must_gather_latest_tag"] = must_gather_tag
 
-    def get_csv_name_pre_upgrade(self):
+    def get_csv_name_pre_upgrade(self, resource_name=OCS_OPERATOR_NAME):
         """
         Getting OCS operator name as displayed in CSV
 
@@ -342,7 +342,7 @@ class OCSUpgrade(object):
         """
         operator_selector = get_selector_for_ocs_operator()
         package_manifest = PackageManifest(
-            resource_name=OCS_OPERATOR_NAME,
+            resource_name=resource_name,
             selector=operator_selector,
             subscription_plan_approval=self.subscription_plan_approval,
         )
