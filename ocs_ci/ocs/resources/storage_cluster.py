@@ -2090,3 +2090,20 @@ def wait_for_consumer_storage_provider_endpoint_in_provider_wnodes(
         func=check_consumer_storage_provider_endpoint_in_provider_wnodes,
     )
     return sample.wait_for_func_status(result=True)
+
+
+def set_non_resilient_pool(storage_cluster: StorageCluster, enable: bool) -> None:
+    cmd = f'[{{ "op": "replace", "path": "/spec/managedResources/cephNonResilientPools/enable", "value": {enable} }}]'
+    storage_cluster.patch(
+        resource_name=constants.DEFAULT_CLUSTERNAME, format_type="json", params=cmd
+    )
+
+
+def validate_non_resilient_pool(storage_cluster: StorageCluster) -> bool:
+    storagecluster_yaml = storage_cluster.get(
+        resource_name=constants.DEFAULT_CLUSTERNAME
+    )
+    if str(storagecluster_yaml["spec"]["managedResources"][""]).lower() == "true":
+        return True
+
+    return False
