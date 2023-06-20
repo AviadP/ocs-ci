@@ -1,0 +1,26 @@
+---
+apiVersion: ocs.openshift.io/v1
+kind: StorageCluster
+metadata:
+  namespace: openshift-storage
+  name: ocs-storagecluster
+spec:
+  managedResources:
+    cephNonResilientPools:
+      enable: true
+  storageDeviceSets:
+  - name: ocs-deviceset
+    count: 1
+    replica: 3
+    resources: {}
+    placement: {}
+    dataPVCTemplate:
+      spec:
+        storageClassName: null
+        accessModes:
+        - ReadWriteOnce
+        volumeMode: Block
+        resources:
+          requests:
+            storage: 1Ti
+    portable: true

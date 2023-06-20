@@ -2092,7 +2092,15 @@ def wait_for_consumer_storage_provider_endpoint_in_provider_wnodes(
     return sample.wait_for_func_status(result=True)
 
 
-def set_non_resilient_pool(storage_cluster: StorageCluster, enable: bool) -> None:
+def set_non_resilient_pool(
+    storage_cluster: StorageCluster, enable: bool = True
+) -> None:
+    """_summary_
+
+    Args:
+        storage_cluster (StorageCluster): StorageCluster object
+        enable (bool, optional): cephNonResilientPools value *** Setting False is not supported by ODF in 4.14 ***.
+    """
     cmd = f'[{{ "op": "replace", "path": "/spec/managedResources/cephNonResilientPools/enable", "value": {enable} }}]'
     storage_cluster.patch(
         resource_name=constants.DEFAULT_CLUSTERNAME, format_type="json", params=cmd
