@@ -3,7 +3,7 @@ import pytest
 from logging import getLogger
 
 from ocs_ci.ocs.resources.pvc import get_all_pvcs
-from ocs_ci.ocs.ephernal_storage import EphemeralPodFactory
+from ocs_ci.ocs.ephemeral_storage import EphemeralPodFactory
 from ocs_ci.ocs.constants import (
     CEPHFS_INTERFACE,
     RBD_INTERFACE,
