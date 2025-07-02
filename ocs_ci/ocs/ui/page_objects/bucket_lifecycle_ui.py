@@ -62,12 +62,8 @@ class BucketLifecycleUI(ObjectStorage, ConfirmDialog):
         self.do_click(f"//tr//a[contains(text(), '{bucket_name}')]", By.XPATH)
         time.sleep(2)
 
-        # Navigate to Management tab
+        # Navigate to Management tab (automatically goes to Lifecycle rules)
         self.do_click(self.bucket_tab["management_tab"])
-        time.sleep(1)
-
-        # Click on Lifecycle rules tab
-        self.do_click(self.bucket_tab["lifecycle_rules_tab"])
         time.sleep(2)
 
         logger.info("Navigated to lifecycle rules page")
@@ -109,8 +105,16 @@ class BucketLifecycleUI(ObjectStorage, ConfirmDialog):
 
         # Handle incomplete multipart uploads action
         if "abort_multipart" in actions:
+            # First click the accordion to expand the section
             self.do_click(self.bucket_tab["incomplete_multipart_checkbox"])
             time.sleep(1)
+
+            # Then click the checkbox to enable the policy
+            self.do_click(self.bucket_tab["incomplete_multipart_enable_checkbox"])
+            time.sleep(2)  # Wait for the days input field to appear
+
+            # Wait for the days input field to be available
+            self.page_has_loaded()
 
             days = actions["abort_multipart"].get("days", 7)
             self.do_clear(self.bucket_tab["incomplete_multipart_days_input"])
@@ -118,21 +122,23 @@ class BucketLifecycleUI(ObjectStorage, ConfirmDialog):
 
         # TODO: Add other actions (expiration, transitions, etc.) when needed
 
-        # Click create button
+        # Wait a moment for the form to be ready and click create button
+        time.sleep(2)
+
+        # Scroll to ensure the Create button is visible
+        create_button = self.get_elements(self.bucket_tab["lifecycle_create_button"])[0]
+        self.driver.execute_script("arguments[0].scrollIntoView();", create_button)
+        time.sleep(1)
+
         self.do_click(self.bucket_tab["lifecycle_create_button"])
         time.sleep(3)
 
+        # Navigate back to the lifecycle rules list page to verify creation
+        # Click the Management tab again to go back to the rules list
+        self.do_click(self.bucket_tab["management_tab"])
+        time.sleep(2)
+
         logger.info(f"Successfully created lifecycle rule: {rule_name}")
-
-    def edit_lifecycle_rule(self, rule_name, **kwargs):
-        """
-        Edit an existing lifecycle rule
-
-        Args:
-            rule_name (str): Name of the rule to edit
-            **kwargs: New settings for the rule
-        """
-        pass
 
     def delete_lifecycle_rule(self, rule_name):
         """
@@ -172,20 +178,67 @@ class BucketLifecycleUI(ObjectStorage, ConfirmDialog):
         """
         try:
             # Wait for rules table to load
-            time.sleep(2)
+            time.sleep(3)
 
-            # Get all rule rows
+            # Ensure we're on the right page
+            self.page_has_loaded()
+
+            # Get all rule rows using multiple possible locators
             rule_elements = self.get_elements(self.bucket_tab["lifecycle_rules_list"])
 
-            # Extract rule names from the first column
+            # If no elements found with primary locator, try alternatives
+            if not rule_elements:
+                # Try alternative table selectors
+                alternative_locators = [
+                    "//table//tbody/tr",
+                    "//table//tr[position()>1]",  # Skip header row
+                    "//div[contains(@class, 'rules')]//tr",
+                    "//tbody/tr",
+                ]
+
+                for alt_locator in alternative_locators:
+                    rule_elements = self.get_elements((alt_locator, By.XPATH))
+                    if rule_elements:
+                        logger.info(f"Found rules using alternative locator: {alt_locator}")
+                        break
+
+            # Extract rule names from the rows
             rule_names = []
             for rule in rule_elements:
                 try:
-                    # Get the name from the first td element
-                    name_element = rule.find_element(By.XPATH, ".//td[@data-label='Name']")
-                    rule_names.append(name_element.text)
-                except NoSuchElementException:
-                    logger.warning("Could not find name element in rule row")
+                    # Try multiple ways to get the rule name
+                    name_element = None
+
+                    # Method 1: data-label='Name'
+                    try:
+                        name_element = rule.find_element(By.XPATH, ".//td[@data-label='Name']")
+                    except NoSuchElementException:
+                        pass
+
+                    # Method 2: First td element
+                    if not name_element:
+                        try:
+                            name_element = rule.find_element(By.XPATH, ".//td[1]")
+                        except NoSuchElementException:
+                            pass
+
+                    # Method 3: Any element with rule name pattern
+                    if not name_element:
+                        try:
+                            name_element = rule.find_element(
+                                By.XPATH,
+                                ".//*[contains(text(), 'rule') or contains(text(), 'multipart')]",
+                            )
+                        except NoSuchElementException:
+                            pass
+
+                    if name_element and name_element.text.strip():
+                        rule_names.append(name_element.text.strip())
+                    else:
+                        logger.warning(f"Could not extract rule name from row: {rule.get_attribute('outerHTML')[:200]}")
+
+                except Exception as row_error:
+                    logger.warning(f"Error processing rule row: {row_error}")
 
             logger.info(f"Found {len(rule_names)} lifecycle rules: {rule_names}")
             return rule_names
@@ -204,7 +257,9 @@ class BucketLifecycleUI(ObjectStorage, ConfirmDialog):
         Returns:
             dict: Rule details including status, scope, filters, and actions
         """
-        pass
+        # TODO: Implement rule details retrieval when needed
+        logger.info(f"Getting details for rule: {rule_name}")
+        return {}
 
     def toggle_rule_status(self, rule_name, enable=True):
         """
@@ -214,4 +269,7 @@ class BucketLifecycleUI(ObjectStorage, ConfirmDialog):
             rule_name (str): Name of the rule
             enable (bool): True to enable, False to disable
         """
-        pass
+        # TODO: Implement rule status toggle when needed
+        action = "enable" if enable else "disable"
+        logger.info(f"Toggling rule '{rule_name}' to {action}")
+        raise NotImplementedError("Rule status toggle not yet implemented")

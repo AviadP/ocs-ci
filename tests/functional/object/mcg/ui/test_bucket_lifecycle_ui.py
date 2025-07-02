@@ -180,10 +180,8 @@ class TestBucketLifecycleUI:
         bucket_ui.create_bucket_ui("s3")
         logger.info("Created bucket via UI")
 
-        # Navigate to Management -> Lifecycle rules
+        # Navigate to Management (automatically goes to Lifecycle rules)
         lifecycle_ui.do_click(lifecycle_ui.bucket_tab["management_tab"])
-        time.sleep(1)
-        lifecycle_ui.do_click(lifecycle_ui.bucket_tab["lifecycle_rules_tab"])
         time.sleep(2)
 
         # Create rule with multipart cleanup

@@ -2259,11 +2259,7 @@ bucket_tab = {
     ),  # Input field for bucket name confirmation
     # Lifecycle policy locators
     "management_tab": (
-        "//button//span[contains(@class, 'pf-v5-c-tabs__item-text') and text()='Management']",
-        By.XPATH,
-    ),
-    "lifecycle_rules_tab": (
-        "//a[contains(@class, 'pf-v5-c-tabs__link') and text()='Lifecycle rules']",
+        "//span[@class='pf-v5-c-tabs__item-text' and text()='Management']/parent::*",
         By.XPATH,
     ),
     "create_lifecycle_rule_button": (
@@ -2296,11 +2292,11 @@ bucket_tab = {
         By.XPATH,
     ),
     "rule_scope_targeted": (
-        "//input[@id='Targeted']",
+        "//input[@id='scope-TARGETED']",
         By.XPATH,
     ),
     "rule_scope_global": (
-        "//input[@id='Global (Bucket-wide)']",
+        "//input[@id='scope-GLOBAL']",
         By.XPATH,
     ),
     "lifecycle_actions_section": (
@@ -2308,15 +2304,22 @@ bucket_tab = {
         By.XPATH,
     ),
     "incomplete_multipart_checkbox": (
-        "//input[@id='Incomplete multipart uploads']",
+        "//button[@id='INCOMPLETE_UPLOADS']",
+        By.XPATH,
+    ),
+    "incomplete_multipart_enable_checkbox": (
+        "//input[@id='incomplete-multiparts-delete']",
         By.XPATH,
     ),
     "incomplete_multipart_days_input": (
-        "//input[@aria-label='inputNumberDaysUntilInitiation']",
+        "//input[@aria-label='inputNumberDaysUntilInitiation'] | "
+        "//input[@type='number'] | "
+        "//div[@id='INCOMPLETE_UPLOADS']//input[@type='number'] | "
+        "//input[contains(@id, 'days')]",
         By.XPATH,
     ),
     "lifecycle_create_button": (
-        "//button[text()='Create']",
+        "//button[text()='Create' and contains(@class, 'pf-m-primary') and @aria-disabled='false']",
         By.XPATH,
     ),
     "lifecycle_cancel_button": (
