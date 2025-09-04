@@ -5,8 +5,10 @@ import os
 import tempfile
 import time
 import yaml
+import copy
 from concurrent.futures import ThreadPoolExecutor
 
+from ocs_ci import framework
 from ocs_ci.deployment.cnv import CNVInstaller
 from ocs_ci.deployment.hyperconverged import HyperConverged
 from ocs_ci.deployment.mce import MCEInstaller
@@ -23,6 +25,7 @@ from ocs_ci.deployment.metallb import MetalLBInstaller
 from ocs_ci.framework.logger_helper import log_step
 from ocs_ci.framework import config as ocsci_config, Config, config
 from ocs_ci.helpers import helpers
+from ocs_ci.helpers.helpers import get_cephfs_subvolumegroup_names
 from ocs_ci.ocs import constants, defaults, ocp
 from ocs_ci.ocs.constants import HCI_PROVIDER_CLIENT_PLATFORMS, FUSION_CONF_DIR
 from ocs_ci.ocs.exceptions import (
@@ -33,6 +36,11 @@ from ocs_ci.ocs.exceptions import (
     UnexpectedDeploymentConfiguration,
 )
 from ocs_ci.ocs.ocp import OCP
+from ocs_ci.ocs.rados_utils import (
+    fetch_pool_names,
+    fetch_rados_namespaces,
+    fetch_filesystem_names,
+)
 from ocs_ci.ocs.resources import storage_cluster
 from ocs_ci.ocs.resources.catalog_source import CatalogSource
 from ocs_ci.ocs.resources.csv import check_all_csvs_are_succeeded
@@ -44,6 +52,12 @@ from ocs_ci.ocs.resources.pod import (
 )
 from ocs_ci.ocs.resources.storageconsumer import (
     create_storage_consumer_on_default_cluster,
+    check_consumers_rns,
+    check_consumers_svg,
+    check_consumer_rns,
+    get_ready_consumers_names,
+    check_consumer_svg,
+    verify_storage_consumer_resources,
 )
 from ocs_ci.ocs.utils import get_pod_name_by_pattern
 from ocs_ci.ocs.version import if_version
@@ -51,15 +65,167 @@ from ocs_ci.utility import templating, version
 from ocs_ci.utility.deployment import get_ocp_ga_version
 from ocs_ci.utility.json import SetToListJSONEncoder
 from ocs_ci.utility.managedservice import generate_onboarding_token
-from ocs_ci.utility.retry import retry
+from ocs_ci.utility.retry import retry, catch_exceptions
 from ocs_ci.utility.utils import (
     exec_cmd,
     TimeoutSampler,
+    wait_for_machineconfigpool_status,
 )
 from ocs_ci.ocs.resources.storage_client import StorageClient
-from ocs_ci.utility.version import get_running_odf_version
+from ocs_ci.utility.ssl_certs import (
+    create_ocs_ca_bundle,
+    get_root_ca_cert,
+)
+from ocs_ci.utility.version import (
+    get_running_odf_version,
+    get_running_odf_client_version,
+)
 
 logger = logging.getLogger(__name__)
+
+
+@if_version(">4.17")
+@catch_exceptions((CommandFailed, TimeoutExpiredError))
+def apply_hosted_cluster_mirrors_max_items_wa():
+    """
+    Apply workaround for MCE mirrors max items issue.
+    This workaround is needed to avoid the error:
+    "The number of items in the mirrors list exceeds the maximum allowed limit of 25"
+    """
+    logger.warning(
+        "!!! Workaround for OCPBUGS-57957: apply MCE mirrors max items workaround !!!"
+    )
+    logger.warning("!!! Remove when resolved !!!")
+    ocp_obj = OCP(kind=constants.CRD_KIND)
+    params = (
+        '[{"op": "replace", '
+        '"path": "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/imageContentSources/items'
+        '/properties/mirrors/maxItems",'
+        '"value": 255}]'
+    )
+    ocp_obj.patch(
+        resource_name=constants.HOSTED_CLUSTERS_CRD_NAME,
+        params=params,
+        format_type="json",
+    )
+
+
+@if_version(">4.17")
+@catch_exceptions((CommandFailed, TimeoutExpiredError))
+def apply_hosted_control_plane_mirrors_max_items_wa():
+    """
+    Apply workaround for Hosted Control Plane mirrors max items issue.
+    This workaround is needed to avoid the error:
+    "The number of items in the mirrors list exceeds the maximum allowed limit of 25"
+    """
+    logger.warning(
+        "!!! Workaround for OCPBUGS-56015: apply Hosted Control Plane mirrors max items workaround !!!"
+    )
+    logger.warning("!!! Remove when resolved !!!")
+    ocp_obj = OCP(kind=constants.CRD_KIND)
+    patch_paths = [
+        "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/imageContentSources/items/properties"
+        "/mirrors/maxItems",
+        "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/imageContentSources/maxItems",
+    ]
+    for path in patch_paths:
+        params = f'[{{"op": "replace", "path": "{path}", "value": 255}}]'
+        ocp_obj.patch(
+            resource_name=constants.HOSTED_CONTROL_PLANE_CRD_NAME,
+            params=params,
+            format_type="json",
+        )
+
+
+def apply_cluster_roles_wa(cluster_names):
+    logger.warning(
+        "!!! Workaround for OCPBUGS-56015: apply cluster roles to all hosted clusters !!!"
+    )
+    logger.warning("!!! Remove when resolved !!!")
+    rbac_wa_file = os.path.join(
+        constants.TEMPLATE_DIR, "hosted-cluster", "rbac-wa.yaml"
+    )
+    rbac_wa_data = templating.load_yaml(rbac_wa_file, multi_document=True)
+    for cluster_name in cluster_names:
+        # Deep copy the original data to avoid modifying it for subsequent clusters
+        cluster_rbac_data = [copy.deepcopy(doc) for doc in rbac_wa_data]
+
+        # Modify each document as needed
+        for doc in cluster_rbac_data:
+            if "namespace" in doc.get("metadata", {}):
+                doc["metadata"]["namespace"] = doc["metadata"]["namespace"].format(
+                    cluster_name
+                )
+
+            if doc.get("kind") == "RoleBinding":
+                for subject in doc.get("subjects", []):
+                    if "namespace" in subject:
+                        subject["namespace"] = subject["namespace"].format(cluster_name)
+
+        # Create a temporary file for the modified YAML
+        rbac_wa_file_modified_file = tempfile.NamedTemporaryFile(
+            mode="w+", prefix="rbac_wa_modified", delete=False
+        )
+        templating.dump_data_to_temp_yaml(
+            cluster_rbac_data, rbac_wa_file_modified_file.name
+        )
+        try:
+            exec_cmd(
+                f"oc create -f {format(rbac_wa_file_modified_file.name)}",
+                shell=True,
+                silent=True,
+            )
+        except CommandFailed:
+            logger.warning("rbac w/a already exist")
+
+
+def skip_if_not_hcp_provider(func):
+    """
+    Decorator to skip the function execution if deployment is not Hosted Control Plane provider
+
+    Returns:
+        function: wrapped function
+    """
+
+    def wrapper(*args, **kwargs):
+        if (
+            config.default_cluster_ctx.ENV_DATA["platform"].lower()
+            not in HCI_PROVIDER_CLIENT_PLATFORMS
+        ):
+            return
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
+@if_version(">4.18")
+def verify_backing_ceph_storage_for_clients():
+    """
+    Verify that backing Ceph storage classes exist on the Provider cluster
+
+    Returns:
+        bool: True if all checks passed, False otherwise
+    """
+
+    all_checks = [check_consumers_svg(), check_consumers_rns()]
+    return all(all_checks)
+
+
+def enable_nested_virtualization():
+    """
+    Enable nested virtualization for the hosted OCP cluster
+    """
+    # Enable nested virtualization on nodes
+    machine_config_data = templating.load_yaml(
+        constants.MACHINE_CONFIG_YAML, multi_document=True
+    )
+    templating.dump_data_to_temp_yaml(
+        machine_config_data, constants.MACHINE_CONFIG_YAML
+    )
+    ocp_obj = ocp.OCP()
+    ocp_obj.exec_oc_cmd(f"apply -f {constants.MACHINE_CONFIG_YAML}")
+    wait_for_machineconfigpool_status(node_type="all")
+    logger.info("All the nodes are upgraded")
 
 
 class HostedClients(HyperShiftBase):
@@ -78,8 +244,8 @@ class HostedClients(HyperShiftBase):
         Deploy multiple hosted OCP clusters on Provider platform and setup ODF client on them
         Perform the 7 stages of deployment:
         1. Deploy multiple hosted OCP clusters
-        2. Verify OCP clusters are ready
-        3. Download kubeconfig files
+        2. Download kubeconfig files
+        3. Verify OCP clusters are ready
         4. Deploy ODF on all hosted clusters if version set in ENV_DATA
         5. Verify ODF client is installed on all hosted clusters if deployed
         6. Setup storage client on all hosted clusters if ENV_DATA.clusters.<cluster_name> has setup_storage_client:true
@@ -111,7 +277,11 @@ class HostedClients(HyperShiftBase):
         if cluster_names:
             cluster_names = self.deploy_hosted_ocp_clusters(cluster_names)
 
-        # stage 2 verify OCP clusters are ready
+        # stage 2 download all available kubeconfig files
+        log_step("Download kubeconfig for all clusters")
+        kubeconfig_paths = self.download_hosted_clusters_kubeconfig_files()
+
+        # stage 3 verify OCP clusters are ready
         log_step(
             "Ensure clusters were deployed successfully, wait for them to be ready"
         )
@@ -119,9 +289,26 @@ class HostedClients(HyperShiftBase):
         if not hosted_ocp_verification_passed:
             logger.error("\n\n*** Some of the clusters are not ready ***\n")
 
-        # stage 3 download all available kubeconfig files
-        log_step("Download kubeconfig for all clusters")
-        kubeconfig_paths = self.download_hosted_clusters_kubeconfig_files()
+            apply_cluster_roles_wa(cluster_names)
+
+            logger.warning("Going through the verification process again")
+            hosted_ocp_verification_passed = (
+                self.verify_hosted_ocp_clusters_from_provider()
+            )
+
+        # configure proxy object with trusted ca bundle for custom ingress ssl certificate
+        if config.DEPLOYMENT.get("use_custom_ingress_ssl_cert"):
+            ssl_ca_cert = get_root_ca_cert()
+            ocs_ca_bundle_name = "ocs-ca-bundle"
+            create_ocs_ca_bundle(ssl_ca_cert, ocs_ca_bundle_name, namespace="clusters")
+            patch = f'{{"spec":{{"configuration":{{"proxy":{{"trustedCA":{{"name":"{ocs_ca_bundle_name}"}}}}}}}}}}'
+            if ssl_ca_cert:
+                for cluster_name in cluster_names:
+                    cmd = (
+                        f"oc patch -n clusters {constants.HOSTED_CLUSTERS}/{cluster_name} --type=merge "
+                        f"--patch='{patch}'"
+                    )
+                    exec_cmd(cmd)
 
         # Need to create networkpolicy as mentioned in bug 2281536,
         # https://bugzilla.redhat.com/show_bug.cgi?id=2281536#c21
@@ -185,7 +372,7 @@ class HostedClients(HyperShiftBase):
                 else:
                     start_time = time.time()
                     client_installed = hosted_odf.setup_storage_client_converged(
-                        storage_consumer_name=f"consumer-{cluster_name}"
+                        storage_consumer_name=f"{constants.STORAGECONSUMER_NAME_PREFIX}{cluster_name}"
                     )
                     time_taken = time.time() - start_time
                     time_sec = int(time_taken % 60) + 1
@@ -229,6 +416,59 @@ class HostedClients(HyperShiftBase):
             if self.storage_installation_requested(name)
         )
 
+        log_step("Verify storage consumers and configmaps for newly deployed clients")
+        storage_consumers_verified = []
+        for hosted_odf_obj in hosted_odf_clusters_installed:
+            cluster_name = hosted_odf_obj.name
+            try:
+                verify_storage_consumer_resources(
+                    f"{constants.STORAGECONSUMER_NAME_PREFIX}{cluster_name}"
+                )
+                storage_consumers_verified.append(True)
+            except Exception as e:
+                logger.error(
+                    f"Storage consumer resources verification failed for cluster {cluster_name}: {e}"
+                )
+                storage_consumers_verified.append(False)
+
+        log_step("verify backing Ceph storage for newly deployed clients")
+
+        consumer_names = get_ready_consumers_names()
+        # we want to validate only consumers that are in ready status, that are newly deployed
+        # and storage installation for them was requested from ENV_DATA.clusters.<cluster_name>.setup_storage_client
+        consumers_to_validate = [
+            consumer_name
+            for consumer_name in consumer_names
+            if any(
+                [
+                    cluster_name
+                    for cluster_name in cluster_names
+                    if (
+                        (cluster_name in consumer_name)
+                        and self.storage_installation_requested(cluster_name)
+                    )
+                ]
+            )
+        ]
+
+        logger.info(
+            f"Consumers to validate: {consumers_to_validate} "
+            f"from all consumers: {consumer_names}"
+        )
+        pool_names = fetch_pool_names()
+        rados_namespaces = fetch_rados_namespaces()
+        svg_names = get_cephfs_subvolumegroup_names()
+        filesystems = fetch_filesystem_names()
+        rns_for_consumer_verified = []
+        svg_for_consumer_verified = []
+        for consumer in consumers_to_validate:
+            consumer_rns_verified = check_consumer_rns(
+                consumer, pool_names, rados_namespaces
+            )
+            consumer_svg_verified = check_consumer_svg(consumer, filesystems, svg_names)
+            rns_for_consumer_verified.append(consumer_rns_verified)
+            svg_for_consumer_verified.append(consumer_svg_verified)
+
         assert (
             hosted_ocp_verification_passed
         ), "Some of the hosted OCP clusters are not ready"
@@ -241,6 +481,16 @@ class HostedClients(HyperShiftBase):
         assert all(
             hosted_odf_storage_verified
         ), "Storage is not available on all hosted ODF clusters"
+        assert all(
+            rns_for_consumer_verified
+        ), "RNS for consumers of deployed clusters failed verification"
+        assert all(
+            svg_for_consumer_verified
+        ), "SVG for consumers of deployed clusters failed verification"
+        assert all(
+            storage_consumers_verified
+        ), "Storage consumer resources verification failed for some of the clusters"
+
         return hosted_odf_clusters_installed
 
     def verify_client_cluster_storage(self, cluster_name):
@@ -474,7 +724,9 @@ class HostedClients(HyperShiftBase):
             )
             return False
 
-    def download_hosted_clusters_kubeconfig_files(self, cluster_names_paths_dict=None):
+    def download_hosted_clusters_kubeconfig_files(
+        self, cluster_names_paths_dict=None, from_hcp=True
+    ):
         """
         Get HyperShift hosted cluster kubeconfig for multiple clusters.
         Provided cluster_names_paths_dict will always be a default source of cluster names and paths
@@ -483,6 +735,7 @@ class HostedClients(HyperShiftBase):
             cluster_names_paths_dict (dict): Optional argument. The function will download all kubeconfigs
             to the folders specified in the configuration, or download a specific cluster's kubeconfig
             to the folder provided as an argument.
+            from_hcp (bool): If True, download kubeconfig from HCP, otherwise from the secret
 
         Returns:
             list: the list of hosted cluster kubeconfig paths
@@ -503,9 +756,8 @@ class HostedClients(HyperShiftBase):
             path = cluster_names_paths_dict.get(name) or config.ENV_DATA.setdefault(
                 "clusters", {}
             ).setdefault(name, {}).get("hosted_cluster_path")
-
             self.kubeconfig_paths.append(
-                self.download_hosted_cluster_kubeconfig(name, path)
+                self.download_hosted_cluster_kubeconfig(name, path, from_hcp=from_hcp)
             )
 
         return self.kubeconfig_paths
@@ -605,7 +857,14 @@ class HypershiftHostedOCP(
             .get("nodepool_replicas", defaults.HYPERSHIFT_NODEPOOL_REPLICAS_DEFAULT)
         )
         cp_availability_policy = (
-            config.ENV_DATA["clusters"].get(self.name).get("cp_availability_policy")
+            config.ENV_DATA["clusters"]
+            .get(self.name)
+            .get("cp_availability_policy", constants.AVAILABILITY_POLICY_HA)
+        )
+        infra_availability_policy = (
+            config.ENV_DATA["clusters"]
+            .get(self.name)
+            .get("infra_availability_policy", constants.AVAILABILITY_POLICY_HA)
         )
         disable_default_sources = (
             config.ENV_DATA["clusters"]
@@ -619,6 +878,7 @@ class HypershiftHostedOCP(
             memory=memory_per_hosted_cluster,
             ocp_version=ocp_version,
             cp_availability_policy=cp_availability_policy,
+            infra_availability_policy=infra_availability_policy,
             disable_default_sources=disable_default_sources,
         )
 
@@ -680,6 +940,12 @@ class HypershiftHostedOCP(
                 "Both deploy_acm_hub and deploy_mce are set to True. "
                 "Please choose only one of them."
             )
+
+        logger.info("Correct max items in hostedclsuters crd")
+        apply_hosted_cluster_mirrors_max_items_wa()
+
+        logger.info("Correct max items in hostedcontrolplane crd")
+        apply_hosted_control_plane_mirrors_max_items_wa()
 
         if deploy_metallb:
             self.deploy_lb()
@@ -793,6 +1059,71 @@ def get_onboarding_token_from_secret(secret_name):
     )
     secret_obj = ocp_obj.get(retry=6, wait=10, silent=True)
     return secret_obj.get("data", {}).get("onboarding-token")
+
+
+def get_autodistributed_storage_classes():
+    """
+    Get the list of StorageClasses that were provisioned by ODF and should be auto-distributed
+
+    Returns:
+        list: List of StorageClass names that were provisioned by ODF
+
+    """
+
+    storage_class = OCP(
+        kind=constants.STORAGECLASS, namespace=config.ENV_DATA["cluster_namespace"]
+    )
+    storage_classes = storage_class.get()
+    # filter only those that were provisioned by ODF
+    storage_classes["items"] = [
+        item
+        for item in storage_classes["items"]
+        if item["provisioner"]
+        in [
+            constants.RBD_PROVISIONER,
+            constants.CEPHFS_PROVISIONER,
+        ]
+    ]
+    # filter out virtualization storage class. We supposed to have it on vSphere and BM, where CRD created
+    storage_classes["items"] = [
+        item
+        for item in storage_classes["items"]
+        if item["metadata"]["name"] != constants.DEFAULT_STORAGECLASS_VIRTUALIZATION
+    ]
+    storage_class_names = [
+        item["metadata"]["name"] for item in storage_classes["items"]
+    ]
+    return storage_class_names
+
+
+def get_autodistributed_volume_snapshot_classes():
+    """
+    Get the list of VolumeSnapshotClasses that were provisioned by ODF and should be auto-distributed
+    upon client connection
+
+    Returns:
+        list: List of VolumeSnapshotClass names that were provisioned by ODF
+
+    """
+    snapshot_class = OCP(
+        kind=constants.VOLUMESNAPSHOTCLASS,
+        namespace=config.ENV_DATA["cluster_namespace"],
+    )
+    snapshot_classes = snapshot_class.get()
+    # filter only those that were provisioned by ODF
+    snapshot_classes["items"] = [
+        item
+        for item in snapshot_classes["items"]
+        if item["driver"]
+        in [
+            constants.RBD_PROVISIONER,
+            constants.CEPHFS_PROVISIONER,
+        ]
+    ]
+    snapshot_class_names = [
+        item["metadata"]["name"] for item in snapshot_classes["items"]
+    ]
+    return snapshot_class_names
 
 
 class HostedODF(HypershiftHostedOCP):
@@ -968,8 +1299,14 @@ class HostedODF(HypershiftHostedOCP):
         """
 
         log_step("Creating storage consumer")
+
+        storage_class_names = get_autodistributed_storage_classes()
+        volumesnapshot_class_names = get_autodistributed_volume_snapshot_classes()
+
         storage_consumer_obj = create_storage_consumer_on_default_cluster(
-            storage_consumer_name
+            storage_consumer_name,
+            storage_classes=storage_class_names,
+            volume_snapshot_classes=volumesnapshot_class_names,
         )
         secret_name = storage_consumer_obj.get_onboarding_ticket_secret()
 
@@ -1146,7 +1483,7 @@ class HostedODF(HypershiftHostedOCP):
         """
         cmd = (
             f"get {constants.STORAGECLIENTS} {constants.DEFAULT_CLUSTERNAME} -n {self.namespace_client} | "
-            "awk '/storage-client/{{print $2}}'"
+            f"awk '/{constants.STORAGE_CLIENT_NAME}/{{print $2}}'"
         )
         return self.exec_oc_cmd(cmd, shell=True).stdout.decode("utf-8").strip()
 
@@ -1274,30 +1611,41 @@ class HostedODF(HypershiftHostedOCP):
         )
 
     @kubeconfig_exists_decorator
-    def create_catalog_source(self):
+    def create_catalog_source(self, reapply=False, odf_version_tag=None):
         """
         Create catalog source for ODF
 
+        Args:
+            reapply (bool): If True, will reapply the catalog source even if it exists
+            odf_version_tag (str): Optional ODF version tag to use for the catalog source image.
+
         Returns:
             bool: True if the catalog source is created, False otherwise
+
         """
         if self.catalog_source_exists():
             logger.info("CatalogSource already exists")
-            return True
+            if not reapply:
+                return True
 
         catalog_source_data = templating.load_yaml(
             constants.PROVIDER_MODE_CATALOGSOURCE
         )
 
         if not config.ENV_DATA.get("clusters").get(self.name).get("hosted_odf_version"):
-            raise ValueError(
-                "OCS version is not set in the config file, should be set in format similar to '4.14.5-8'"
-                "in the 'hosted_odf_version' key in the 'ENV_DATA.clusters.<name>' section of the config file. "
-            )
+            if not reapply:
+                raise ValueError(
+                    "OCS version is not set in the config file, should be set in format similar to '4.14.5-8'"
+                    "in the 'hosted_odf_version' key in the 'ENV_DATA.clusters.<name>' section of the config file. "
+                )
 
-        odf_version = (
-            config.ENV_DATA.get("clusters").get(self.name).get("hosted_odf_version")
-        )
+        if odf_version_tag:
+            # If odf_version_tag is provided, use it instead of the one from config
+            odf_version = odf_version_tag
+        else:
+            odf_version = (
+                config.ENV_DATA.get("clusters").get(self.name).get("hosted_odf_version")
+            )
         odf_registry = (
             config.ENV_DATA.get("clusters")
             .get(self.name)
@@ -1388,15 +1736,12 @@ class HostedODF(HypershiftHostedOCP):
         hosted_odf_version = (
             config.ENV_DATA.get("clusters").get(self.name).get("hosted_odf_version")
         )
-        if "latest" in hosted_odf_version:
+        if any(tag in hosted_odf_version for tag in ["latest", "stable"]):
             hosted_odf_version = hosted_odf_version.split("-")[-1]
 
-        if "konflux" in hosted_odf_version and "-" in hosted_odf_version:
-            version_semantic = version.get_semantic_version(
-                hosted_odf_version.split("-")[0]
-            )
-            hosted_odf_version = f"{version_semantic.major}.{version_semantic.minor}"
+        version_semantic = version.get_semantic_version(hosted_odf_version)
 
+        hosted_odf_version = f"{version_semantic.major}.{version_semantic.minor}"
         subscription_data["spec"]["channel"] = f"stable-{str(hosted_odf_version)}"
 
         subscription_file = tempfile.NamedTemporaryFile(
@@ -1626,7 +1971,7 @@ class HostedODF(HypershiftHostedOCP):
         )
         return ocp.check_resource_existence(
             timeout=self.timeout_check_resources_exist_sec,
-            selector="app=csi-cephfsplugin",
+            selector=helpers.get_node_plugin_label(constants.CEPHFILESYSTEM),
             should_exist=True,
         )
 
@@ -1694,6 +2039,7 @@ class HostedODF(HypershiftHostedOCP):
         return False
 
 
+@skip_if_not_hcp_provider
 def hypershift_cluster_factory(
     cluster_names=None,
     ocp_version=None,
@@ -1718,9 +2064,10 @@ def hypershift_cluster_factory(
     """
 
     hosted_clients_obj = HostedClients()
-    logger.info(f"Factory duty is '{duty}'")
+    logger.info(f"hypershift_cluster_factory duty is '{duty}'")
 
-    if duty == "create_hosted_cluster_push_config":
+    # this section 1. is to gather and remove configurations and execute deployment due to the duty
+    if duty == constants.DUTY_CREATE_HOSTED_CLUSTER_PUSH_CONFIG:
         hosted_cluster_conf_on_provider = {"ENV_DATA": {"clusters": {}}}
         for cluster_name in cluster_names:
             # this configuration is necessary to deploy hosted cluster, but not for running tests with multicluster job
@@ -1748,16 +2095,22 @@ def hypershift_cluster_factory(
         deployed_clusters = [obj.name for obj in deployed_hosted_cluster_objects]
 
     elif duty in [
-        "use_existing_hosted_clusters_force_push_configs",
-        "use_existing_hosted_clusters_push_missing_configs",
+        constants.DUTY_USE_EXISTING_HOSTED_CLUSTERS_FORCE_PUSH_CONFIG,
+        constants.DUTY_USE_EXISTING_HOSTED_CLUSTERS_PUSH_MISSING_CONFIG,
     ]:
         cl_name_ver_dict = get_available_hosted_clusters_to_ocp_ver_dict()
+        if not cl_name_ver_dict:
+            logger.warning(
+                "No hosted clusters found. Please create hosted clusters first."
+            )
+            return
         deployed_clusters = list(cl_name_ver_dict.keys())
 
-        if "use_existing_hosted_clusters_force_push_configs" in duty:
+        if constants.DUTY_USE_EXISTING_HOSTED_CLUSTERS_FORCE_PUSH_CONFIG in duty:
             existing_clusters = {
                 conf.ENV_DATA.get("cluster_name") for conf in config.clusters
             }
+            # remove clusters from config that are already deployed and exist in MultiClusterConfig
             clusters_to_remove = existing_clusters.intersection(deployed_clusters)
             if clusters_to_remove:
                 for cluster_name in clusters_to_remove:
@@ -1765,8 +2118,11 @@ def hypershift_cluster_factory(
                         f"Removing cluster config {cluster_name} from config file, as it is already deployed"
                     )
                     config.remove_cluster_by_name(cluster_name)
-
-        if duty == "use_existing_hosted_clusters_push_missing_configs":
+            # assign to deployed_clusters remaining clusters after removal
+            deployed_clusters = {
+                conf.ENV_DATA.get("cluster_name") for conf in config.clusters
+            }
+        if duty == constants.DUTY_USE_EXISTING_HOSTED_CLUSTERS_PUSH_MISSING_CONFIG:
             clusters_in_config = {
                 conf.ENV_DATA.get("cluster_name") for conf in config.clusters
             }
@@ -1778,7 +2134,10 @@ def hypershift_cluster_factory(
         logger.warning("Factory function was called without deployment duty")
         deployed_clusters = []
 
+    # this section 2. is to push the config of the existing clusters to MultiClusterConfig due to the duty,
+    # including newly created clusters, in case we can detect nodes of guest cluster and ODF version
     for cluster_name in deployed_clusters:
+        default_index = config.get_provider_index()
 
         if not nodepool_replicas:
             nodepool_replicas = get_current_nodepool_size(cluster_name)
@@ -1806,10 +2165,28 @@ def hypershift_cluster_factory(
                 k: (v if v is not None else {})
                 for (k, v) in yaml.safe_load(file_stream).items()
             }
+
             def_client_config_dict.get("ENV_DATA").update(
                 {"cluster_name": cluster_name}
             )
-            running_odf_version = get_running_odf_version()
+            def_client_config_dict["ENV_DATA"].setdefault(
+                "default_cluster_context_index", default_index
+            )
+            try:
+                running_odf_version = get_running_odf_version()
+            except IndexError:
+                # Hard Requirement: ODF operator and ODF client operator must run on the same version
+                logger.error(
+                    "No existing ODF operator and its version found for the cluster, trying Client operator"
+                )
+                try:
+                    running_odf_version = get_running_odf_client_version()
+                except IndexError:
+                    logger.error(
+                        "No existing ODF client operator and its version found for the cluster, ODF is not installed"
+                    )
+                    continue
+
             if running_odf_version:
                 env_data = def_client_config_dict.setdefault("ENV_DATA", {})
                 env_data["ocs_version"] = running_odf_version
@@ -1823,17 +2200,53 @@ def hypershift_cluster_factory(
                     "installer_version"
                 ] = running_ocp_version
 
-            cluster_path = create_cluster_dir(cluster_name)
-            kubeconf_path = (
-                hosted_clients_obj.download_hosted_clusters_kubeconfig_files(
-                    {cluster_name: cluster_path}
+            with ocsci_config.RunWithConfigContext(default_index):
+                cluster_path = create_cluster_dir(cluster_name)
+                def_client_config_dict["ENV_DATA"]["cluster_path"] = cluster_path
+                kubeconf_paths = (
+                    hosted_clients_obj.download_hosted_clusters_kubeconfig_files(
+                        {cluster_name: cluster_path}, from_hcp=False
+                    )
                 )
-            )
+                if not kubeconf_paths:
+                    from ocs_ci.framework.exceptions import (
+                        ClusterKubeconfigNotFoundError,
+                    )
 
-            logger.info(f"Kubeconfig path: {kubeconf_path}")
+                    raise ClusterKubeconfigNotFoundError(
+                        f"Failed to download kubeconfig for cluster {cluster_name}"
+                    )
+                else:
+                    kubeconf_path = [
+                        path for path in kubeconf_paths if cluster_name in path
+                    ][0]
+            logger.debug(f"Kubeconfig path: {kubeconf_path}")
+
+            logger.debug(
+                "Setting default context to config. Every config should have same default context"
+            )
+            # sync our configurations with the one in MultiClusterConfig to have the same default context index
+            # we set provider's index to every client config
             def_client_config_dict.setdefault("RUN", {}).update(
                 {"kubeconfig": kubeconf_path}
             )
+            run_keys = [
+                "run_id",
+                "log_dir",
+                "bin_dir",
+                "jenkins_build_url",
+                "logs_url",
+                "cluster_dir_full_path",
+                "kubeconfig",
+            ]
+            def_client_config_dict.setdefault("RUN", {})
+            for key in run_keys:
+                def_client_config_dict["RUN"][key] = (
+                    framework.config.RUN.get(key, "")
+                    if key != "kubeconfig"
+                    else kubeconf_path
+                )
+
             cluster_config = Config()
             cluster_config.update(def_client_config_dict)
 

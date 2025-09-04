@@ -9,25 +9,37 @@ import tempfile
 import shutil
 import requests
 import subprocess
+import time
+import glob
 
 import semantic_version
 import platform
+import tarfile
 
 from ocs_ci.framework import config
 from ocs_ci.ocs import constants
 from ocs_ci.ocs.exceptions import (
     CommandFailed,
     DRPrimaryNotFoundException,
+    SubctlDownloadFailed,
     UnsupportedPlatformError,
 )
 from ocs_ci.utility import templating
 from ocs_ci.ocs.utils import get_non_acm_cluster_config, get_primary_cluster_config
+from ocs_ci.utility.ibmcloud import (
+    set_region,
+    login,
+    assign_floating_ips_to_workers,
+    set_resource_group_name,
+    is_ibm_platform,
+)
+from ocs_ci.utility.retry import retry
 from ocs_ci.utility.utils import (
     run_cmd,
     run_cmd_interactive,
     wait_for_machineconfigpool_status,
 )
-from ocs_ci.ocs.node import get_typed_worker_nodes, label_nodes
+from ocs_ci.ocs.node import get_typed_worker_nodes, label_nodes, get_worker_nodes
 
 logger = logging.getLogger(__name__)
 
@@ -110,23 +122,48 @@ class Submariner(object):
             old_ctx = config.cur_index
             for cluster in get_non_acm_cluster_config():
                 config.switch_ctx(cluster.MULTICLUSTER["multicluster_index"])
-                self.create_acm_brew_icsp()
+                self.create_acm_brew_idms()
             config.switch_ctx(old_ctx)
+
         global_net = get_primary_cluster_config().ENV_DATA.get("enable_globalnet", True)
-        acm_obj.install_submariner_ui(globalnet=global_net)
+        if (
+            is_ibm_platform()
+            and get_primary_cluster_config().ENV_DATA.get("deployment_type")
+            == constants.IPI_DEPL_TYPE
+        ):
+            logger.info("Logging into IBMCLOUD CLI")
+            login()
+
+            for cluster in get_non_acm_cluster_config():
+                config.switch_ctx(cluster.MULTICLUSTER["multicluster_index"])
+
+                set_region()
+                set_resource_group_name()
+                floating_ips_dict = assign_floating_ips_to_workers()
+                for node in get_worker_nodes():
+                    cmd = (
+                        f"oc annotate node {node} "
+                        f"gateway.submariner.io/public-ip=ipv4:{floating_ips_dict.get(node)} --overwrite"
+                    )
+                    run_cmd(cmd=cmd, secrets=[floating_ips_dict.get(node)])
+
+            acm_obj.install_submariner_cli(globalnet=global_net)
+        else:
+            acm_obj.install_submariner_ui(globalnet=global_net)
+
         acm_obj.submariner_validation_ui()
 
-    def create_acm_brew_icsp(self):
+    def create_acm_brew_idms(self):
         """
         This is a prereq for downstream unreleased submariner
 
         """
-        icsp_data = templating.load_yaml(constants.SUBMARINER_DOWNSTREAM_BREW_ICSP)
-        icsp_data_yaml = tempfile.NamedTemporaryFile(
-            mode="w+", prefix="acm_icsp", delete=False
+        idms_data = templating.load_yaml(constants.SUBMARINER_DOWNSTREAM_BREW_IDMS)
+        idms_data_yaml = tempfile.NamedTemporaryFile(
+            mode="w+", prefix="acm_idms", delete=False
         )
-        templating.dump_data_to_temp_yaml(icsp_data, icsp_data_yaml.name)
-        run_cmd(f"oc create -f {icsp_data_yaml.name}", timeout=300)
+        templating.dump_data_to_temp_yaml(idms_data, idms_data_yaml.name)
+        run_cmd(f"oc apply -f {idms_data_yaml.name}", timeout=300)
         wait_for_machineconfigpool_status(node_type="all")
 
     def download_binary(self):
@@ -166,6 +203,38 @@ class Submariner(object):
         elif self.source == "downstream":
             self.download_downstream_binary()
 
+    @retry((tarfile.TarError, EOFError, FileNotFoundError), tries=8, delay=5)
+    def wait_for_tar_file(self, subctl_download_tar_file):
+        """
+        1. First check if file exists
+        2. Check if file is accessible
+        3. check if tarfile is intact
+        """
+        if not os.path.exists(subctl_download_tar_file):
+            raise FileNotFoundError(f"Tar file not found {subctl_download_tar_file}")
+        else:
+            logger.info(f"Found the tar file {subctl_download_tar_file}")
+
+        if os.path.isfile(f"{subctl_download_tar_file}") and os.access(
+            f"{subctl_download_tar_file}", os.R_OK
+        ):
+            logger.info(f"File {subctl_download_tar_file} successfully downloaded")
+            try:
+                # Check if tar is readable without any errors
+                with tarfile.open(subctl_download_tar_file) as tar:
+                    tar.getmembers()
+                logger.info("the tar.xz is intact and readable")
+            except (tarfile.TarError, EOFError) as tar_error:
+                logger.error(f"The tar.xz is corrupted or not readable {tar_error}")
+                raise
+        else:
+            logger.warning(
+                f"File {subctl_download_tar_file} is not accessible or corrupted,"
+                f"Retrying reading the tar file again"
+            )
+            raise tarfile.TarError()
+
+    @retry((SubctlDownloadFailed, CommandFailed))
     def download_downstream_binary(self):
         """
         Download downstream subctl binary
@@ -193,22 +262,46 @@ class Submariner(object):
             f'--path="/dist/subctl-{version_str}*-linux-{binary_pltfrm}.tar.xz":/tmp --confirm'
         )
         run_cmd(cmd)
-        decompress = (
-            f"tar -C /tmp/ -xf /tmp/subctl-{version_str}*-linux-{binary_pltfrm}.tar.xz"
+        # After oc image extract wait for some time
+        # so that tar won't fail
+        time.sleep(10)
+        # Check if file exists before calling tar
+        subctl_download_tar_file = glob.glob(
+            f"/tmp/subctl-{version_str}*-linux-{binary_pltfrm}.tar.xz"
+        )[0]
+        try:
+            self.wait_for_tar_file(subctl_download_tar_file)
+        except Exception as e:
+            logger.error(
+                f"Unexpected error during subctl tar file download/extract: {e}"
+            )
+            raise SubctlDownloadFailed("Failed to download subctl tar file")
+
+        decompress = f"tar -C /tmp/ -xf {subctl_download_tar_file}"
+        p = subprocess.run(
+            decompress,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            text=True,
         )
-        p = subprocess.run(decompress, stdout=subprocess.PIPE, shell=True)
         if p.returncode:
             logger.error("Failed to untar subctl")
+            if p.stderr:
+                logger.error(f"{p.stderr}")
             raise CommandFailed
         else:
-            logger.info(p.stdout)
+            logger.info(f"Tar decompressed successfully {p.stdout}")
         target_dir = config.RUN["bin_dir"]
         install_cmd = (
             f"install -m744 /tmp/subctl-{version_str}*/subctl-{version_str}*-linux-{binary_pltfrm} "
             f"{target_dir} "
         )
         run_cmd(install_cmd, shell=True)
-        run_cmd(f"mv {target_dir}/subctl-* {target_dir}/subctl", shell=True)
+        subctl_bin_file = glob.glob(
+            f"{target_dir}/subctl-{version_str}*-linux-{binary_pltfrm}"
+        )[0]
+        run_cmd(f"mv {subctl_bin_file} {target_dir}/subctl", shell=True)
         os.environ["PATH"] = os.environ["PATH"] + ":" + os.path.abspath(f"{target_dir}")
 
     def submariner_configure_upstream(self):

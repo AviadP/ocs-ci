@@ -4,7 +4,9 @@ import pytest
 from ocs_ci.framework.pytest_customization.marks import (
     green_squad,
     tier1,
+    tier3,
     skipif_external_mode,
+    skipif_ms_provider_and_consumer,
 )
 from ocs_ci.framework.testlib import skipif_ocs_version
 from ocs_ci.framework import config
@@ -23,9 +25,9 @@ log = logging.getLogger(__name__)
 
 
 @green_squad
-@tier1
 @skipif_external_mode
 @skipif_ocs_version("<4.14")
+@skipif_ms_provider_and_consumer
 class TestCustomStorageClassNames:
     def setup(self):
         self.custom_sc_list = []
@@ -72,6 +74,7 @@ class TestCustomStorageClassNames:
             ),
         ],
     )
+    @tier1
     def test_custom_storageclass_post_deployment(self, interface):
         """
         Test custom storage class creation post deployment.
@@ -107,6 +110,7 @@ class TestCustomStorageClassNames:
             ("special", 10, False),
         ],
     )
+    @tier3
     def test_custom_storageclass_names_character_limit(
         self, sc_name, str_length, expect_to_pass
     ):

@@ -11,6 +11,7 @@ from ocs_ci.framework.testlib import (
     skipif_ocs_version,
     ManageTest,
     tier1,
+    tier2,
     tier3,
     skipif_ocp_version,
     skipif_managed_service,
@@ -50,7 +51,7 @@ class TestMetadataUnavailable(ManageTest):
         ],
     )
     @polarion_id("OCS-4669")
-    def test_metadata_feature_unavailable_for_previous_versions(
+    def deprecated_test_metadata_feature_unavailable_for_previous_versions(
         self, project_factory_class, sc_name, fs
     ):
         """
@@ -136,95 +137,6 @@ class TestMetadataUnavailable(ManageTest):
         ), f"PVC {pvc_obj.name} is not deleted"
 
 
-@tier1
-@skipif_ocs_version("<4.12")
-@skipif_ocp_version("<4.12")
-@skipif_managed_service
-@skipif_disconnected_cluster
-@skipif_proxy_cluster
-@green_squad
-@ignore_leftovers
-class TestDefaultMetadataDisabled(ManageTest):
-    """
-    Test metadata feature disabled by default for ODF 4.12
-
-    """
-
-    @pytest.mark.parametrize(
-        argnames=["fs", "sc_name"],
-        argvalues=[
-            pytest.param(
-                "ocs-storagecluster-cephfilesystem",
-                constants.DEFAULT_STORAGECLASS_CEPHFS,
-            )
-        ],
-    )
-    @polarion_id("OCS-4671")
-    @polarion_id("OCS-4674")
-    def test_metadata_not_enabled_by_default(
-        self, pvc_factory, pvc_clone_factory, fs, sc_name
-    ):
-        """
-        This test is to validate metadata feature is not enabled by default for  ODF(4.12) clusters
-
-        Steps:
-        1:- Check CSI_ENABLE_METADATA flag unavailable by default in rook-ceph-operator-config
-        and setmetadata is unavailable for csi-cephfsplugin-provisioner and csi-rbdplugin-provisioner pods
-        2. metadata details unavailable for
-            1. a newly created RBD PVC
-            2. PVC clone
-
-        """
-        external_mode = config.DEPLOYMENT["external_mode"]
-        fs, sc_name = metadata_utils.update_testdata_for_external_modes(
-            sc_name, fs, external_mode=external_mode
-        )
-        config_map_obj = ocp.OCP(
-            kind="Configmap", namespace=config.ENV_DATA["cluster_namespace"]
-        )
-        pod_obj = ocp.OCP(kind="Pod", namespace=config.ENV_DATA["cluster_namespace"])
-        toolbox = pod.get_ceph_tools_pod()
-        # enable metadata flag not available by default
-        metadata_flag = config_map_obj.exec_oc_cmd(
-            "get cm rook-ceph-operator-config --output  jsonpath='{.data.CSI_ENABLE_METADATA}'"
-        )
-        log.info(f"metadata flag----{metadata_flag}")
-        if metadata_flag is None:
-            log.info("metadata feature is not enabled by default.")
-        else:
-            log.error("metadata feature is enabled by default")
-
-        # Check 'setmatadata' is not set for csi-cephfsplugin-provisioner and csi-rbdplugin-provisioner pods
-        res = metadata_utils.check_setmetadata_availability(pod_obj)
-        assert (
-            not res
-        ), "Error: The metadata is set, while it is expected to be unavailable "
-        _ = metadata_utils.available_subvolumes(sc_name, toolbox, fs)
-        # create a pvc with cephfs sc
-        pvc_obj = pvc_factory(
-            interface=constants.CEPHFILESYSTEM, status=constants.STATUS_BOUND
-        )
-        log.info(f"PVC {pvc_obj.name} created!")
-        # create a clone of the PVC
-        cloned_pvc_obj = pvc_clone_factory(pvc_obj)
-        log.info(f"Clone of PVC {pvc_obj.name} created!")
-        updated_subvolumes = metadata_utils.available_subvolumes(sc_name, toolbox, fs)
-        for sub_vol in updated_subvolumes:
-            metadata = metadata_utils.fetch_metadata(
-                sc_name, fs, toolbox, sub_vol["name"]
-            )
-            assert metadata == {}, "Error: Metadata details are available"
-        # Delete PVCs
-        pvc_obj.delete()
-        pvc_obj.ocp.wait_for_delete(
-            resource_name=pvc_obj.name, timeout=300
-        ), f"PVC {pvc_obj.name} is not deleted"
-        cloned_pvc_obj.delete()
-        cloned_pvc_obj.ocp.wait_for_delete(
-            resource_name=cloned_pvc_obj.name, timeout=300
-        ), f"PVC {cloned_pvc_obj.name} is not deleted"
-
-
 @skipif_ocs_version("<4.12")
 @skipif_ocp_version("<4.12")
 @skipif_managed_service
@@ -281,19 +193,19 @@ class TestMetadata(ManageTest):
             self.pod_obj,
         )
 
-    @tier1
     @pytest.mark.parametrize(
         argnames=["fs", "sc_name"],
         argvalues=[
             pytest.param(
                 "ocs-storagecluster-cephfilesystem",
                 constants.DEFAULT_STORAGECLASS_CEPHFS,
-                marks=pytest.mark.polarion_id("OCS-4676"),
+                marks=[tier1, pytest.mark.polarion_id("OCS-4676")],
             ),
             pytest.param(
                 "ocs-storagecluster-cephblockpool",
                 constants.DEFAULT_STORAGECLASS_RBD,
                 marks=[
+                    tier2,
                     pytest.mark.polarion_id("OCS-4679"),
                 ],
             ),
@@ -419,7 +331,7 @@ class TestMetadata(ManageTest):
             resource_name=clone_pvc_obj.name, timeout=300
         ), f"PVC {clone_pvc_obj.name} is not deleted"
 
-    @tier1
+    @tier2
     @pytest.mark.parametrize(
         argnames=["fs", "sc_name"],
         argvalues=[
@@ -515,7 +427,7 @@ class TestMetadata(ManageTest):
             resource_name=pvc_obj.name, timeout=300
         ), f"PVC {pvc_obj.name} is not deleted"
 
-    @tier1
+    @tier2
     @pytest.mark.parametrize(
         argnames=["fs", "sc_name"],
         argvalues=[
@@ -782,7 +694,6 @@ class TestMetadata(ManageTest):
             resource_name=pvc_obj_with_metadata_disabled.name, timeout=300
         ), f"PVC {pvc_obj_with_metadata_disabled.name} is not deleted"
 
-    @tier1
     @pytest.mark.parametrize(
         argnames=["fs", "sc_name"],
         argvalues=[
@@ -793,6 +704,7 @@ class TestMetadata(ManageTest):
     )
     @polarion_id("OCS-4680")
     @polarion_id("OCS-4681")
+    @tier2
     def test_metadata_update_for_PV_Retain(self, fs, sc_name, project_factory_class):
         """
         This test is to validate metadata is updated after a PVC is deleted by setting ReclaimPloicy: Retain on PV
@@ -954,54 +866,3 @@ class TestMetadata(ManageTest):
         pvc_obj_in_dif_namespace.ocp.wait_for_delete(
             resource_name=pvc_obj_in_dif_namespace.name, timeout=600
         ), f"PVC {pvc_obj_in_dif_namespace.name} is not deleted"
-
-    @tier3
-    @pytest.mark.parametrize(
-        argnames=["flag_value"],
-        argvalues=[
-            pytest.param("12345678"),
-            pytest.param("feature3504"),
-            pytest.param("add-metadata"),
-        ],
-    )
-    @polarion_id("OCS-4682")
-    def test_negative_values_for_enable_metadata_flag(self, flag_value):
-        """
-        Validate negative scenarios by providing various un acceptable values for, CSI_ENABLE_METADATA flag.
-        1. numeric value for CSI_ENABLE_METADATA flag
-        2. alphanumeric value for CSI_ENABLE_METADATA flag
-        3. string values other than 'true/false' for CSI_ENABLE_METADATA flag
-
-        Steps:
-            1. Set CSI_ENABLE_METADATA flag value as numeric value
-            2. Set CSI_ENABLE_METADATA flag value as alphanumeric value
-            3. Set string values other than 'true/false' for CSI_ENABLE_METADATA flag
-        """
-        # Set numeric value for CSI_ENABLE_METADATA flag
-        params = '{"data":{"CSI_ENABLE_METADATA": ' + '"' + flag_value + '"' + "}}"
-        log.info(f"params ----- {params}")
-
-        # Enable CSI_ENABLE_OMAP_GENERATOR flag for rook-ceph-operator-config using patch command
-        assert self.config_map_obj.patch(
-            resource_name="rook-ceph-operator-config",
-            params=params,
-        ), "configmap/rook-ceph-operator-config not patched"
-
-        # Check csi-cephfsplugin provisioner and csi-rbdplugin-provisioner pods are up and running
-        assert self.pod_obj.wait_for_resource(
-            condition=constants.STATUS_RUNNING,
-            selector="app=csi-cephfsplugin-provisioner",
-            dont_allow_other_resources=True,
-            timeout=60,
-        )
-
-        assert self.pod_obj.wait_for_resource(
-            condition=constants.STATUS_RUNNING,
-            selector="app=csi-rbdplugin-provisioner",
-            dont_allow_other_resources=True,
-            timeout=60,
-        )
-        res = metadata_utils.check_setmetadata_availability(self.pod_obj)
-        assert (
-            not res
-        ), "Error: The metadata is set, while it is expected to be unavailable "

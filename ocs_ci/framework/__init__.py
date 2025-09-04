@@ -9,6 +9,7 @@ under section PYTEST_DONT_REWRITE
 
 # Use the new python 3.7 dataclass decorator, which provides an object similar
 # to a namedtuple, but allows type enforcement and defining methods.
+import functools
 import os
 import yaml
 import logging
@@ -271,11 +272,18 @@ class MultiClusterConfig:
             ClusterNotFoundException: In case it didn't find the provider cluster
 
         """
-        for i, cluster in enumerate(self.clusters):
-            if cluster.ENV_DATA["cluster_type"] == "provider":
-                return i
-
-        raise ClusterNotFoundException("Didn't find the provider cluster")
+        provider_name = config.ENV_DATA.get("provider_cluster_name")
+        provider_index = None
+        if provider_name:
+            provider_index = self.get_cluster_index_by_name(cluster_name=provider_name)
+        else:
+            for i, cluster in enumerate(self.clusters):
+                if cluster.ENV_DATA["cluster_type"] == "provider":
+                    provider_index = i
+                    break
+        if provider_index is None:
+            raise ClusterNotFoundException("Didn't find the provider cluster")
+        return provider_index
 
     def get_provider_cluster_indexes(self):
         """
@@ -303,7 +311,11 @@ class MultiClusterConfig:
         """
         consumer_indexes_list = []
         for i, cluster in enumerate(self.clusters):
-            if cluster.ENV_DATA["cluster_type"] in ["consumer", "hci_client"]:
+            if cluster.ENV_DATA.get("cluster_type", "").lower() in [
+                "consumer",
+                "hci_client",
+                "client",
+            ]:
                 consumer_indexes_list.append(i)
 
         if not consumer_indexes_list:
@@ -374,6 +386,24 @@ class MultiClusterConfig:
 
         """
         return self.ENV_DATA.get("cluster_name")
+
+    def get_cluster_name_by_index(self, index):
+        """
+        Get the cluster name by the cluster index
+
+        Args:
+            index (int): The cluster index
+
+        Returns:
+            str: The cluster name
+
+        Raises:
+            ClusterNotFoundException: In case it didn't find the cluster
+
+        """
+        if index < 0 or index >= self.nclusters:
+            raise ClusterNotFoundException(f"Cluster with index {index} not found")
+        return self.clusters[index].ENV_DATA.get("cluster_name", "")
 
     def is_provider_exist(self):
         """
@@ -515,6 +545,26 @@ class MultiClusterConfig:
                 logger.debug("No provider was found - using current cluster")
                 switch_index = config.cur_index
             super().__init__(switch_index)
+
+    @staticmethod
+    def run_with_provider_context_if_available(func):
+        """
+        Decorator that runs the function using the Provider config if it exists.
+        If no Provider config is found, the function runs with the current config.
+
+        Args:
+            func (callable): Function to decorate.
+
+        Returns:
+            callable: Wrapped function.
+        """
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            with config.RunWithProviderConfigContextIfAvailable():
+                return func(*args, **kwargs)
+
+        return wrapper
 
     class RunWithFirstConsumerConfigContextIfAvailable(RunWithConfigContext):
         """

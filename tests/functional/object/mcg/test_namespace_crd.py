@@ -140,7 +140,7 @@ class TestNamespace(MCGTest):
                     },
                 },
                 marks=[
-                    tier1,
+                    tier2,
                     on_prem_platform_required,
                     pytest.mark.polarion_id("OCS-6339"),
                 ],
@@ -154,7 +154,7 @@ class TestNamespace(MCGTest):
                     },
                 },
                 marks=[
-                    tier1,
+                    tier2,
                     pytest.mark.polarion_id("OCS-6353"),
                 ],
             ),
@@ -167,7 +167,7 @@ class TestNamespace(MCGTest):
                     },
                 },
                 marks=[
-                    tier1,
+                    tier2,
                     pytest.mark.polarion_id("OCS-6354"),
                 ],
             ),
@@ -180,8 +180,9 @@ class TestNamespace(MCGTest):
                     },
                 },
                 marks=[
-                    tier1,
+                    tier2,
                     pytest.mark.polarion_id("OCS-6355"),
+                    skipif_fips_enabled,
                 ],
             ),
             pytest.param(
@@ -193,7 +194,7 @@ class TestNamespace(MCGTest):
                     },
                 },
                 marks=[
-                    tier1,
+                    tier2,
                     pytest.mark.polarion_id("OCS-6356"),
                 ],
             ),
@@ -209,7 +210,7 @@ class TestNamespace(MCGTest):
                     },
                 },
                 marks=[
-                    tier1,
+                    tier2,
                     on_prem_platform_required,
                     pytest.mark.polarion_id("OCS-6338"),
                 ],
@@ -225,7 +226,7 @@ class TestNamespace(MCGTest):
                     },
                 },
                 marks=[
-                    tier1,
+                    tier2,
                     on_prem_platform_required,
                     pytest.mark.polarion_id("OCS-6351"),
                 ],
@@ -239,7 +240,7 @@ class TestNamespace(MCGTest):
                     },
                 },
                 marks=[
-                    tier1,
+                    tier2,
                     pytest.mark.polarion_id("OCS-5442"),
                     skipif_fips_enabled,
                 ],
@@ -369,7 +370,7 @@ class TestNamespace(MCGTest):
         s3_creds = {
             "access_key_id": cld_mgr.aws_client.access_key,
             "access_key": cld_mgr.aws_client.secret_key,
-            "endpoint": constants.MCG_NS_AWS_ENDPOINT,
+            "endpoint": constants.MCG_NS_AWS_ENDPOINT.format(self.DEFAULT_REGION),
             "region": self.DEFAULT_REGION,
         }
         aws_target_bucket = ns_bucket.bucketclass.namespacestores[0].uls_name
@@ -440,7 +441,7 @@ class TestNamespace(MCGTest):
         s3_creds = {
             "access_key_id": cld_mgr.aws_client.access_key,
             "access_key": cld_mgr.aws_client.secret_key,
-            "endpoint": constants.MCG_NS_AWS_ENDPOINT,
+            "endpoint": constants.MCG_NS_AWS_ENDPOINT.format(self.DEFAULT_REGION),
             "region": self.DEFAULT_REGION,
         }
         aws_target_bucket = ns_bucket.bucketclass.namespacestores[0].uls_name
@@ -470,7 +471,7 @@ class TestNamespace(MCGTest):
             amount=3,
         )
 
-    @tier1
+    @tier2
     @pytest.mark.polarion_id("OCS-2258")
     @on_prem_platform_required
     def test_distribution_of_objects_in_ns_bucket_crd(
@@ -530,7 +531,7 @@ class TestNamespace(MCGTest):
         aws_creds = {
             "access_key_id": cld_mgr.aws_client.access_key,
             "access_key": cld_mgr.aws_client.secret_key,
-            "endpoint": constants.MCG_NS_AWS_ENDPOINT,
+            "endpoint": constants.MCG_NS_AWS_ENDPOINT.format(self.DEFAULT_REGION),
             "region": self.DEFAULT_REGION,
         }
         self.write_files_to_pod_and_upload(
@@ -602,8 +603,14 @@ class TestNamespace(MCGTest):
         s3_creds = {
             "access_key_id": cld_mgr.aws_client.access_key,
             "access_key": cld_mgr.aws_client.secret_key,
-            "endpoint": constants.MCG_NS_AWS_ENDPOINT,
-            "region": self.DEFAULT_REGION,
+            "endpoint": constants.MCG_NS_AWS_ENDPOINT.format(
+                bucketclass_dict["namespace_policy_dict"]["namespacestore_dict"]["aws"][
+                    0
+                ][1]
+            ),
+            "region": bucketclass_dict["namespace_policy_dict"]["namespacestore_dict"][
+                "aws"
+            ][0][1],
         }
 
         original_folder = test_directory_setup.origin_dir
@@ -677,8 +684,14 @@ class TestNamespace(MCGTest):
         s3_creds = {
             "access_key_id": cld_mgr.aws_client.access_key,
             "access_key": cld_mgr.aws_client.secret_key,
-            "endpoint": constants.MCG_NS_AWS_ENDPOINT,
-            "region": self.DEFAULT_REGION,
+            "endpoint": constants.MCG_NS_AWS_ENDPOINT.format(
+                bucketclass_dict["namespace_policy_dict"]["namespacestore_dict"]["aws"][
+                    0
+                ][1]
+            ),
+            "region": bucketclass_dict["namespace_policy_dict"]["namespacestore_dict"][
+                "aws"
+            ][0][1],
         }
 
         original_folder = test_directory_setup.origin_dir
@@ -719,7 +732,7 @@ class TestNamespace(MCGTest):
         ):
             raise UnexpectedBehaviour("Cached object was not downloaded")
 
-    @tier1
+    @tier2
     @pytest.mark.parametrize(
         argnames=["bucketclass_dict"],
         argvalues=[
@@ -730,7 +743,7 @@ class TestNamespace(MCGTest):
                         "type": "Cache",
                         "ttl": 10000,
                         "namespacestore_dict": {
-                            "aws": [(1, "eu-central-1")],
+                            "aws": [(1, DEFAULT_REGION)],
                         },
                     },
                     "placement_policy": {
@@ -765,7 +778,7 @@ class TestNamespace(MCGTest):
         s3_creds = {
             "access_key_id": cld_mgr.aws_client.access_key,
             "access_key": cld_mgr.aws_client.secret_key,
-            "endpoint": constants.MCG_NS_AWS_ENDPOINT,
+            "endpoint": constants.MCG_NS_AWS_ENDPOINT.format(self.DEFAULT_REGION),
             "region": self.DEFAULT_REGION,
         }
         aws_target_bucket = bucket_obj.bucketclass.namespacestores[0].uls_name
@@ -1014,7 +1027,7 @@ class TestNamespace(MCGTest):
         aws_creds = {
             "access_key_id": cld_mgr.aws_client.access_key,
             "access_key": cld_mgr.aws_client.secret_key,
-            "endpoint": constants.MCG_NS_AWS_ENDPOINT,
+            "endpoint": constants.MCG_NS_AWS_ENDPOINT.format(self.DEFAULT_REGION),
             "region": self.DEFAULT_REGION,
         }
 
@@ -1067,15 +1080,27 @@ class TestNamespace(MCGTest):
 
     @tier4c
     @pytest.mark.parametrize(
-        argnames=["mcg_pod"],
+        argnames=["mcg_pod", "respin_multiple_times"],
         argvalues=[
             pytest.param(
                 *["noobaa-db"],
+                False,
                 marks=[pytest.mark.polarion_id("OCS-2291")],
             ),
-            pytest.param(*["noobaa-core"], marks=pytest.mark.polarion_id("OCS-2319")),
             pytest.param(
-                *["noobaa-operator"], marks=pytest.mark.polarion_id("OCS-2320")
+                *["noobaa-db"],
+                True,
+                marks=[pytest.mark.polarion_id("OCS-6907")],
+            ),
+            pytest.param(
+                *["noobaa-core"],
+                False,
+                marks=pytest.mark.polarion_id("OCS-2319"),
+            ),
+            pytest.param(
+                *["noobaa-operator"],
+                False,
+                marks=pytest.mark.polarion_id("OCS-2320"),
             ),
         ],
     )
@@ -1088,6 +1113,7 @@ class TestNamespace(MCGTest):
         bucket_factory,
         test_directory_setup,
         mcg_pod,
+        respin_multiple_times,
     ):
         """
         Test Write to ns bucket using CRDs and read directly from AWS.
@@ -1115,7 +1141,7 @@ class TestNamespace(MCGTest):
         s3_creds = {
             "access_key_id": cld_mgr.aws_client.access_key,
             "access_key": cld_mgr.aws_client.secret_key,
-            "endpoint": constants.MCG_NS_AWS_ENDPOINT,
+            "endpoint": constants.MCG_NS_AWS_ENDPOINT.format(self.DEFAULT_REGION),
             "region": self.DEFAULT_REGION,
         }
         original_folder = test_directory_setup.origin_dir
@@ -1135,17 +1161,13 @@ class TestNamespace(MCGTest):
         if not obj_ls:
             raise UnexpectedBehaviour("Failed to sync objects")
 
-        logger.info(f"Respin mcg resource {mcg_pod}")
-        noobaa_pods = pod.get_noobaa_pods()
-        pod_obj = [pod for pod in noobaa_pods if pod.name.startswith(mcg_pod)][0]
-        pod_obj.delete(force=True)
-        logger.info("Wait for noobaa pods to come up")
-        assert pod_obj.ocp.wait_for_resource(
-            condition="Running",
-            selector="app=noobaa",
-            resource_count=len(noobaa_pods),
-            timeout=1000,
-        )
+        if respin_multiple_times:
+            count = 10
+            for _ in range(count):
+                self.respin_mcg_pod(mcg_pod)
+        else:
+            self.respin_mcg_pod(mcg_pod)
+
         logger.info("Wait for noobaa health to be OK")
         ceph_cluster_obj = CephCluster()
         ceph_cluster_obj.wait_for_noobaa_health_ok()
@@ -1214,7 +1236,7 @@ class TestNamespace(MCGTest):
         s3_creds = {
             "access_key_id": cld_mgr.aws_client.access_key,
             "access_key": cld_mgr.aws_client.secret_key,
-            "endpoint": constants.MCG_NS_AWS_ENDPOINT,
+            "endpoint": constants.MCG_NS_AWS_ENDPOINT.format(self.DEFAULT_REGION),
             "region": self.DEFAULT_REGION,
         }
 
@@ -1426,3 +1448,19 @@ class TestNamespace(MCGTest):
                 )
                 result = False
         return result
+
+    def respin_mcg_pod(self, mcg_pod):
+        """
+        Respin specified mcg pod
+        """
+        logger.info(f"Respin mcg resource {mcg_pod}")
+        noobaa_pods = pod.get_noobaa_pods()
+        pod_obj = [pod for pod in noobaa_pods if pod.name.startswith(mcg_pod)][0]
+        pod_obj.delete(force=True)
+        logger.info("Wait for noobaa pods to come up")
+        assert pod_obj.ocp.wait_for_resource(
+            condition="Running",
+            selector="app=noobaa",
+            resource_count=len(noobaa_pods),
+            timeout=1000,
+        )

@@ -3,6 +3,9 @@ import logging
 import tempfile
 import time
 
+from ocs_ci.deployment.helpers.lso_helpers import (
+    create_optional_operators_catalogsource_non_ga,
+)
 from ocs_ci.framework import config
 from ocs_ci.ocs import constants
 from ocs_ci.ocs.constants import (
@@ -18,18 +21,21 @@ from ocs_ci.ocs.constants import (
 )
 from ocs_ci.ocs.exceptions import CommandFailed
 from ocs_ci.ocs.ocp import OCP
-from ocs_ci.utility.retry import retry
-from ocs_ci.ocs.resources.catalog_source import CatalogSource
+from ocs_ci.utility.retry import retry, catch_exceptions
+from ocs_ci.ocs.resources.catalog_source import CatalogSource, disable_specific_source
 from ocs_ci.ocs.resources.csv import check_all_csvs_are_succeeded
 from ocs_ci.ocs.resources.pod import wait_for_pods_to_be_running
 from ocs_ci.ocs.utils import get_pod_name_by_pattern
 from ocs_ci.utility import templating
 from ocs_ci.utility.utils import (
     exec_cmd,
-    get_ocp_version,
+    run_cmd,
     TimeoutSampler,
     wait_for_machineconfigpool_status,
+    get_running_ocp_version,
 )
+from pkg_resources import parse_version
+from ocs_ci.ocs.resources.install_plan import wait_for_install_plan_and_approve
 
 logger = logging.getLogger(__name__)
 
@@ -92,49 +98,56 @@ class MetalLBInstaller:
         )
 
     @retry(CommandFailed, tries=3, delay=15)
-    def create_catalog_source(self):
+    def create_catalog_source(
+        self, metallb_version=config.default_cluster_ctx.ENV_DATA.get("metallb_version")
+    ):
         """
         Create catalog source for MetalLB
 
+        Arg:
+            metallb_version (str): MetalLB version
+
         Returns:
             bool: True if catalog source is created, False otherwise, error if not get Ready state
+
         """
         logger.info("Creating catalog source for MetalLB")
-        # replace latest version with specific version
-        catalog_source_data = templating.load_yaml(QE_APP_REGISTRY_SOURCE)
 
-        metallb_version = config.default_cluster_ctx.ENV_DATA.get("metallb_version")
-        if not metallb_version:
-            metallb_version = get_ocp_version()
+        self.catalog_source_name = self.get_catsrc_name()
 
-        image_placeholder = catalog_source_data.get("spec").get("image")
-        catalog_source_data.get("spec").update(
-            {"image": image_placeholder.format(metallb_version)}
+        if not self.catalog_source_created():
+
+            create_optional_operators_catalogsource_non_ga(force=True)
+            metallb_catalog_source = CatalogSource(
+                resource_name=self.catalog_source_name,
+                namespace=MARKETPLACE_NAMESPACE,
+            )
+            return metallb_catalog_source.wait_for_state("READY")
+        else:
+            logger.info(
+                f"Catalog Source {constants.QE_APP_REGISTRY_CATALOG_SOURCE_NAME} already exists"
+            )
+            return True
+
+    def get_catsrc_name(self):
+        """
+        Helper function to get the catalog source name
+
+        Returns:
+            str: The name of the catalog source for MetalLB
+        """
+        optional_operators_data = list(
+            templating.load_yaml(
+                constants.LOCAL_STORAGE_OPTIONAL_OPERATORS, multi_document=True
+            )
         )
-
-        self.catalog_source_name = catalog_source_data.get("metadata").get("name")
-
-        if self.catalog_source_created():
-            logger.info(f"Catalog Source {self.catalog_source_name} already exists")
-            return
-
-        # install catalog source
-        metallb_catalog_file = tempfile.NamedTemporaryFile(
-            mode="w+", prefix="metallb_catalogsource", delete=False
-        )
-        templating.dump_data_to_temp_yaml(
-            catalog_source_data, metallb_catalog_file.name
-        )
-
-        exec_cmd(f"oc apply -f {metallb_catalog_file.name}", timeout=2400)
-
-        # wait for catalog source is ready
-        metallb_catalog_source = CatalogSource(
-            resource_name=self.catalog_source_name,
-            namespace=MARKETPLACE_NAMESPACE,
-        )
-
-        return metallb_catalog_source.wait_for_state("READY")
+        for optional_operator in optional_operators_data:
+            if optional_operator.get("kind") == "CatalogSource":
+                return optional_operator.get("metadata").get("name")
+        else:
+            raise ValueError(
+                "CatalogSource name not found in the optional operators data"
+            )
 
     def metallb_operator_group_created(self):
         """
@@ -215,9 +228,19 @@ class MetalLBInstaller:
 
         self.subscription_name = subscription_data.get("metadata").get("name")
 
+        if not self.catalog_source_name:
+            self.catalog_source_name = self.get_catsrc_name()
+
+        subscription_data.get("spec").update(
+            {
+                "source": self.catalog_source_name,
+                "sourceNamespace": MARKETPLACE_NAMESPACE,
+            }
+        )
+
         if self.subscription_created():
             logger.info(f"Subscription {self.subscription_name} already exists")
-            return
+            return None
 
         metallb_subscription_file = tempfile.NamedTemporaryFile(
             mode="w+", prefix="metallb_subscription", delete=False
@@ -315,7 +338,7 @@ class MetalLBInstaller:
         )
         templating.dump_data_to_temp_yaml(metallb_inst_data, metallb_inst_file.name)
 
-        retry(CommandFailed, tries=3, delay=15)(exec_cmd)(
+        retry(CommandFailed, tries=18, delay=30)(exec_cmd)(
             f"oc apply -f {metallb_inst_file.name}", timeout=240
         )
 
@@ -383,7 +406,7 @@ class MetalLBInstaller:
         )
         templating.dump_data_to_temp_yaml(ipaddresspool_data, ipaddresspool_file.name)
 
-        retry(CommandFailed, tries=3, delay=15)(exec_cmd)(
+        retry(CommandFailed, tries=12, delay=15)(exec_cmd)(
             f"oc apply -f {ipaddresspool_file.name}", timeout=240
         )
 
@@ -497,12 +520,11 @@ class MetalLBInstaller:
             logger.info("MetalLB operator deployment is not requested")
             return True
 
+        self.correct_idms()
+
         logger.info(
             f"Deploying MetalLB and dependant resources to namespace: '{self.namespace_lb}'"
         )
-
-        if self.apply_icsp():
-            logger.info("ICSP brew-registry applied successfully")
         if self.create_metallb_namespace():
             logger.info(f"Namespace {self.namespace_lb} created successfully")
         if self.create_catalog_source():
@@ -669,15 +691,15 @@ class MetalLBInstaller:
                 break
         return True
 
-    def icsp_brew_registry_exists(self):
+    def idms_brew_registry_exists(self):
         """
-        Check if the ICSP Brew registry exists
+        Check if the IDMS Brew registry exists
 
         Returns:
-            bool: True if the ICSP Brew registry exists, False otherwise
+            bool: True if the IDMS Brew registry exists, False otherwise
         """
         return OCP(
-            kind="ImageContentSourcePolicy", resource_name="brew-registry"
+            kind="ImageDigestMirrorSet", resource_name="brew-registry"
         ).check_resource_existence(
             timeout=self.timeout_check_resources_existence, should_exist=True
         )
@@ -698,3 +720,163 @@ class MetalLBInstaller:
         wait_for_machineconfigpool_status(node_type="all")
         logger.info("ICSP applied successfully")
         return self.icsp_brew_registry_exists()
+
+    def metallb_patch_subscription(self, patch):
+        """
+        Update the subscription with patch information
+
+        Args:
+            patch (dict): patch information
+
+        """
+        metallb_subs_obj = OCP(
+            kind=constants.SUBSCRIPTION_WITH_ACM,
+            namespace=self.namespace_lb,
+            resource_name=constants.METALLB,
+        )
+        metallb_subs_obj.patch(params=patch, format_type="merge")
+
+    def get_running_metallb_version(self):
+        """
+        Get the currently deployed cnv version
+
+        Returns:
+            string: metalLB version
+
+        """
+        metallb_subs_obj = OCP(
+            kind=constants.SUBSCRIPTION_WITH_ACM,
+            namespace=self.namespace_lb,
+            resource_name=constants.METALLB,
+        )
+        metallb_version = metallb_subs_obj.get()["status"]["installedCSV"]
+        metallb_version = metallb_version.split(".v")[1].split("-")[0]
+        return metallb_version
+
+    def upgrade_metallb(self):
+        """
+        Upgrade metalLB operator
+
+        Returns:
+            bool: if metallb operator is upgraded successfully
+
+        """
+        metallb_subs_obj = OCP(
+            kind=constants.SUBSCRIPTION_WITH_ACM,
+            namespace=self.namespace_lb,
+            resource_name=constants.METALLB,
+        )
+        metallb_catalog_source = CatalogSource(
+            resource_name=constants.QE_APP_REGISTRY_CATALOG_SOURCE_NAME,
+            namespace=MARKETPLACE_NAMESPACE,
+        )
+
+        logger.info("Check if metallb is installed")
+        if not self.metallb_instance_created():
+            logger.error("metalLb operator unavailable")
+            return False
+
+        logger.info(
+            f"Currently installed metallb version: {parse_version(self.get_running_metallb_version())}"
+        )
+        self.upgrade_version = config.UPGRADE.get("upgrade_metallb_version")
+        if not self.upgrade_version:
+            self.upgrade_version = get_running_ocp_version()
+        logger.info(
+            f"Upgarde metallb version to: {parse_version(self.upgrade_version)}"
+        )
+        if self.upgrade_version == parse_version(self.get_running_metallb_version()):
+            logger.info("Metallb operator is not upgradeable")
+            return True
+
+        self.catalog_source_name = constants.QE_APP_REGISTRY_CATALOG_SOURCE_NAME
+        catalog_source_data = templating.load_yaml(QE_APP_REGISTRY_SOURCE)
+        # create catsrc
+        if self.catalog_source_created():
+            logger.info(
+                f"Catalog Source {constants.QE_APP_REGISTRY_CATALOG_SOURCE_NAME} already exists"
+            )
+            # Upgrade image details in the catalogsource
+            image_placeholder = catalog_source_data.get("spec").get("image")
+            catalog_source_data.get("spec").update(
+                {"image": image_placeholder.format(self.upgrade_version)}
+            )
+            # install catalog source
+            metallb_catalog_file = tempfile.NamedTemporaryFile(
+                mode="w+", prefix="metallb_catalogsource", delete=False
+            )
+            templating.dump_data_to_temp_yaml(
+                catalog_source_data, metallb_catalog_file.name
+            )
+            disable_specific_source(constants.QE_APP_REGISTRY_CATALOG_SOURCE_NAME)
+            run_cmd(f"oc apply -f {metallb_catalog_file.name}", timeout=2400)
+
+            # wait for catalog source is ready
+            metallb_catalog_source.wait_for_state("READY")
+
+        else:
+            self.create_catalog_source(metallb_version=self.upgrade_version)
+
+        # wait for sometime before checking the latest metallb version
+        time.sleep(60)
+        if metallb_subs_obj.get()["spec"]["installPlanApproval"] != "Automatic":
+            patch = '{"spec": {"installPlanApproval": "Automatic"}}'
+            metallb_subs_obj.patch(params=patch, format_type="merge")
+            wait_for_install_plan_and_approve(self.namespace)
+
+        metallb_version_post_upgrade = self.get_running_metallb_version()
+        logger.info(f"metallb version post upgrade: {metallb_version_post_upgrade}")
+        return self.upgrade_version in metallb_version_post_upgrade
+
+    def apply_idms(self):
+        """
+        Apply the IDMS to the cluster
+        """
+        if self.idms_brew_registry_exists():
+            logger.info("IDMS Brew registry already exists")
+            return
+        idms_data = templating.load_yaml(constants.SUBMARINER_DOWNSTREAM_BREW_IDMS)
+        idms_data_yaml = tempfile.NamedTemporaryFile(
+            mode="w+", prefix="acm_idms", delete=False
+        )
+        templating.dump_data_to_temp_yaml(idms_data, idms_data_yaml.name)
+        exec_cmd(f"oc apply -f {idms_data_yaml.name}", timeout=300)
+        wait_for_machineconfigpool_status(node_type="all")
+        logger.info("IDMS applied successfully")
+        return self.idms_brew_registry_exists()
+
+    @catch_exceptions((CommandFailed, TimeoutError))
+    def correct_idms(self):
+        """
+        This is a workaround for the issue with IDMS Brew registry.
+        We don't want to affect other components, so we only delete one mirror item that causes the issue.
+
+        This resolves issue with metallb operator deployment installation when they stuck in ImagePullBackOff
+
+        """
+        logger.info(
+            "Correcting IDMS Brew registry if it exists, to stop redirection to quay.io:443/acm-d"
+        )
+
+        idms_obj = OCP(kind=constants.IMAGEDIGESTMIRRORSET, resource_name="acm-idms")
+        if idms_obj.check_resource_existence(
+            timeout=self.timeout_check_resources_existence, should_exist=True
+        ):
+            logger.info("IDMS Brew registry exists, correcting it")
+            idms_data = idms_obj.get()
+            new_image_digest_mirrors = [
+                item
+                for item in idms_data["spec"]["imageDigestMirrors"]
+                if not (
+                    item.get("mirrors") == ["quay.io:443/acm-d"]
+                    and item.get("source") == "registry.redhat.io/openshift4"
+                )
+            ]
+            patch_payload = {"spec": {"imageDigestMirrors": new_image_digest_mirrors}}
+            patch_payload_json = json.dumps(patch_payload)
+            idms_obj.patch(params=patch_payload_json, format_type="merge")
+            logger.info("ACM Brew IDMS registry corrected successfully")
+
+            wait_for_machineconfigpool_status(node_type="all")
+
+        logger.info("IDMS correction is done")

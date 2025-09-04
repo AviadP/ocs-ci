@@ -4,6 +4,7 @@ all related hooks/plugins to markers.
 """
 
 import os
+import sys
 
 import pytest
 from funcy import compose
@@ -39,11 +40,13 @@ from ocs_ci.ocs.constants import (
     AZURE_KV_PROVIDER_NAME,
     ROSA_HCP_PLATFORM,
     VAULT_KMS_PROVIDER,
+    NFS_OUTCLUSTER_TEST_PLATFORMS,
+    DUTY_USE_EXISTING_HOSTED_CLUSTERS_PUSH_MISSING_CONFIG,
 )
 from ocs_ci.utility import version
 from ocs_ci.utility.aws import update_config_from_s3
 from ocs_ci.utility.utils import load_auth_config
-
+from ocs_ci.deployment.hosted_cluster import hypershift_cluster_factory
 
 # tier marks
 
@@ -133,6 +136,7 @@ order_post_upgrade = pytest.mark.order(ORDER_AFTER_UPGRADE)
 order_post_ocp_upgrade = pytest.mark.order(ORDER_AFTER_OCP_UPGRADE)
 order_post_ocs_upgrade = pytest.mark.order(ORDER_AFTER_OCS_UPGRADE)
 ocp_upgrade = compose(order_ocp_upgrade, pytest.mark.ocp_upgrade)
+
 # multicluster orchestrator
 mco_upgrade = compose(order_mco_upgrade, pytest.mark.mco_upgrade)
 # dr hub operator
@@ -143,6 +147,12 @@ dr_cluster_operator_upgrade = compose(
 # acm operator
 acm_upgrade = compose(order_acm_upgrade, pytest.mark.acm_upgrade)
 ocs_upgrade = compose(order_ocs_upgrade, pytest.mark.ocs_upgrade)
+
+# provider operator upgrade
+provider_operator_upgrade = compose(
+    order_ocs_upgrade, pytest.mark.provider_operator_upgrade
+)
+
 # pre_*_upgrade markers
 pre_upgrade = compose(order_pre_upgrade, pytest.mark.pre_upgrade)
 pre_ocp_upgrade = compose(
@@ -228,6 +238,14 @@ skipif_fips_enabled = pytest.mark.skipif(
     reason="This test cannot run on FIPS enabled cluster",
 )
 
+skipif_fips_enabled_on_ibm_cloud = pytest.mark.skipif(
+    (
+        config.ENV_DATA.get("fips") == "true"
+        and config.ENV_DATA["platform"].lower() == "ibm_cloud"
+    ),
+    reason="This test cannot run on FIPS enabled IBM cluster",
+)
+
 fips_required = pytest.mark.skipif(
     config.ENV_DATA.get("fips") != "true",
     reason="Test runs only on FIPS enabled cluster",
@@ -287,6 +305,10 @@ ibmcloud_platform_required = pytest.mark.skipif(
 on_prem_platform_required = pytest.mark.skipif(
     config.ENV_DATA["platform"].lower() not in ON_PREM_PLATFORMS,
     reason="Test runs ONLY on on-prem based deployed cluster",
+)
+nfs_outcluster_test_platform_required = pytest.mark.skipif(
+    config.ENV_DATA["platform"].lower() not in NFS_OUTCLUSTER_TEST_PLATFORMS,
+    reason="Test runs ONLY on the platforms part of NFS_OUTCLUSTER_TEST_PLATFORMS",
 )
 
 rh_internal_lab_required = pytest.mark.skipif(
@@ -398,18 +420,61 @@ hci_provider_and_client_required = pytest.mark.skipif(
     ),
     reason="Test runs ONLY on Fusion HCI provider and client clusters",
 )
+
+
 # when run_on_all_clients marker is used, there needs to be added cluster_index
 # parameter to the test to prevent any issues with the test parametrization
-run_on_all_clients = pytest.mark.run_on_all_clients
-try:
-    client_indexes = [
-        pytest.param(*[idx]) for idx in config.get_consumer_indexes_list()
-    ]
-    run_on_all_clients = pytest.mark.parametrize(
-        argnames=["cluster_index"], argvalues=client_indexes, indirect=True
-    )
-except ClusterNotFoundException:
-    pass
+def setup_multicluster_marker(marker_base, push_missing_configs=False):
+    """
+    Set up multicluster marker with parametrization based on client indexes.
+
+    Args:
+        marker_base: Base pytest marker to be parametrized
+        push_missing_configs: Boolean flag to push missing configs
+
+    Returns:
+        Parametrized marker or original marker if setup fails
+    """
+    try:
+        if push_missing_configs:
+            # run this only if cluster type is provider and it is part of test execution stage (not deployment or
+            # teardown)
+            # FIXME: the usage of `sys.argv` here is not correct, but we can't use something like
+            # `config.RUN["cli_params"]["deploy"]`, because this setup_multicluster_marker(...) function is called on
+            # the module level (see the lines below this function definition) which means that it is actually called
+            # immediately when the module is imported and the config object is not fully initialized (especially some of
+            # the command line arguments are not processed)
+            # the solution will be to move following logic to some fixture (similarly as we have session scope autouse
+            # fixture `cluster`, which is responsible for deploying and teardown of the whole cluster (when particular
+            # parameters are passed)
+            test_stage = not ("--deploy" in sys.argv or "--teardown" in sys.argv)
+            if (
+                config.default_cluster_ctx.ENV_DATA["cluster_type"].lower()
+                == HCI_PROVIDER
+                and config.default_cluster_ctx.ENV_DATA["platform"].lower()
+                in HCI_PROVIDER_CLIENT_PLATFORMS
+            ) and test_stage:
+                hypershift_cluster_factory(
+                    duty=DUTY_USE_EXISTING_HOSTED_CLUSTERS_PUSH_MISSING_CONFIG,
+                )
+        client_indexes = [
+            pytest.param(*[idx]) for idx in config.get_consumer_indexes_list()
+        ]
+        if len(client_indexes):
+            config.multicluster = True
+            return pytest.mark.parametrize(
+                argnames=["cluster_index"], argvalues=client_indexes, indirect=True
+            )
+        return marker_base
+    except ClusterNotFoundException:
+        return marker_base
+
+
+run_on_all_clients = setup_multicluster_marker(pytest.mark.run_on_all_clients)
+run_on_all_clients_push_missing_configs = setup_multicluster_marker(
+    pytest.mark.run_on_all_clients, True
+)
+
 kms_config_required = pytest.mark.skipif(
     (
         config.ENV_DATA["KMS_PROVIDER"].lower() != HPCS_KMS_PROVIDER
@@ -522,6 +587,9 @@ skipif_hci_provider_or_client = pytest.mark.skipif(
     reason="Test will not run on Fusion HCI provider or Client clusters",
 )
 
+# Marker for skipping tests for provider clusters based on OCS version
+skip_for_provider_if_ocs_version = pytest.mark.skip_for_provider_if_ocs_version
+
 skipif_rosa = pytest.mark.skipif(
     config.ENV_DATA["platform"].lower() == ROSA_PLATFORM,
     reason="Test will not run on ROSA cluster",
@@ -612,13 +680,6 @@ metrics_for_external_mode_required = pytest.mark.skipif(
     and config.DEPLOYMENT.get("external_mode") is True,
     reason="Metrics is not enabled for external mode OCS <4.6",
 )
-
-rdr_ui_skipif = pytest.mark.skipif(
-    not config.RUN.get("rdr_failover_via_ui")
-    or not config.RUN.get("rdr_relocate_via_ui"),
-    reason="RDR UI failover or relocate config needed",
-)
-rdr_ui = compose(rdr_ui_skipif, pytest.mark.rdr_ui)
 
 dr_hub_recovery = pytest.mark.skipif(
     config.nclusters != 4,

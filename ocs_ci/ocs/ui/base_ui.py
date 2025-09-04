@@ -125,6 +125,8 @@ class BaseUI:
             Path(self.dom_folder).mkdir(parents=True, exist_ok=True)
         logger.debug(f"dom files folder:{self.dom_folder}")
 
+        # Don't remove self.ocp_version as it's heavily used in child classes
+        self.ocp_version = get_ocp_version()
         self.running_ocp_semantic_version = version.get_semantic_ocp_running_version()
         self.ocp_version_full = version.get_semantic_ocp_version_from_config()
         self.ocs_version_semantic = version.get_semantic_ocs_version_from_config()
@@ -324,7 +326,7 @@ class BaseUI:
             timeout (int): Looks for a web element repeatedly until timeout (sec) happens.
 
         return:
-            bool: True if element expended, False otherwise
+            bool: True if element expanded, False otherwise
 
         """
         wait = WebDriverWait(self.driver, timeout)
@@ -854,7 +856,8 @@ class SeleniumDriver(WebDriver):
             headless = ocsci_config.UI_SELENIUM.get("headless")
             if headless:
                 chrome_options.add_argument("--headless=new")
-                chrome_options.add_argument("window-size=1920,1400")
+                chrome_options.add_argument("--window-size=1920,1400")
+                chrome_options.add_argument("--force-device-scale-factor=1")
 
             # use proxy server, if required
             if (

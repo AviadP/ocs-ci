@@ -18,6 +18,8 @@ import inspect
 import stat
 import platform
 import ipaddress
+
+from urllib.parse import urlparse, urlunparse
 from concurrent.futures import ThreadPoolExecutor
 from itertools import cycle
 from subprocess import PIPE, run
@@ -38,8 +40,6 @@ from ocs_ci.ocs.utils import (
     get_nb_db_psql_version_from_image,
     query_nb_db_psql_version,
 )
-
-from ocs_ci.ocs.node import get_worker_nodes, wait_for_nodes_status
 from ocs_ci.ocs import constants, defaults, node, ocp, exceptions
 from ocs_ci.ocs.exceptions import (
     CommandFailed,
@@ -48,7 +48,6 @@ from ocs_ci.ocs.exceptions import (
     TimeoutExpiredError,
     UnavailableBuildException,
     UnexpectedBehaviour,
-    NotSupportedException,
 )
 from ocs_ci.ocs.ocp import OCP
 from ocs_ci.ocs.resources import pod, pvc
@@ -245,7 +244,7 @@ def create_pod(
     interface_type=None,
     pvc_name=None,
     do_reload=True,
-    namespace=config.ENV_DATA["cluster_namespace"],
+    namespace=None,
     node_name=None,
     pod_dict_path=None,
     sa_name=None,
@@ -299,7 +298,7 @@ def create_pod(
         AssertionError: In case of any failure
 
     """
-
+    namespace = namespace or config.ENV_DATA["cluster_namespace"]
     if (
         interface_type == constants.CEPHBLOCKPOOL
         or interface_type == constants.CEPHBLOCKPOOL_THICK
@@ -622,9 +621,7 @@ def create_ceph_block_pool(
     return cbp_obj
 
 
-def create_ceph_file_system(
-    cephfs_name=None, label=None, namespace=config.ENV_DATA["cluster_namespace"]
-):
+def create_ceph_file_system(cephfs_name=None, label=None, namespace=None):
     """
     Create a Ceph file system
 
@@ -636,6 +633,7 @@ def create_ceph_file_system(
     Returns:
         OCS: An OCS instance for the Ceph file system
     """
+    namespace = namespace or config.ENV_DATA["cluster_namespace"]
     cephfs_data = templating.load_yaml(constants.CEPHFILESYSTEM_YAML)
     cephfs_data["metadata"]["name"] = (
         cephfs_name if cephfs_name else create_unique_resource_name("test", "cfs")
@@ -657,11 +655,21 @@ def create_ceph_file_system(
     return cephfs_data
 
 
+@retry(
+    CommandFailed,
+    tries=6,
+    delay=30,
+    backoff=1,
+)
 def default_storage_class(
     interface_type,
 ):
     """
     Return default storage class based on interface_type
+
+    This function usually runs as one of the first functions after the StorageCluster CR is applied.
+    This makes the function more prone to failures when DF/DF Client operators have not finalized provisioning;
+    retry adds redundancy to the function.
 
     Args:
         interface_type (str): The type of the interface
@@ -670,6 +678,8 @@ def default_storage_class(
     Returns:
         OCS: Existing StorageClass Instance
     """
+    from ocs_ci.ocs.resources.storageconsumer import StorageConsumer
+
     external = config.DEPLOYMENT["external_mode"]
     rbd_namespace = config.EXTERNAL_MODE.get("rbd_namespace")
     custom_storage_class = config.ENV_DATA.get("custom_default_storageclass_names")
@@ -725,11 +735,34 @@ def default_storage_class(
             else:
                 resource_name = constants.DEFAULT_STORAGECLASS_CEPHFS
     base_sc = OCP(kind="storageclass", resource_name=resource_name)
-    base_sc.wait_for_resource(
-        condition=resource_name,
-        column="NAME",
-        timeout=240,
-    )
+    try:
+        base_sc.wait_for_resource(
+            condition=resource_name,
+            column="NAME",
+            timeout=240,
+        )
+    except (CommandFailed, TimeoutExpiredError):
+        logger.error(
+            f"Storage class {resource_name} not found due to bug DFBUGS-3791. "
+            f"Applying workaround to fix the issue"
+        )
+        consumer_context = config.cluster_ctx.ENV_DATA.get(
+            "default_cluster_context_index", 0
+        )
+        storage_consumer = StorageConsumer(
+            constants.INTERNAL_STORAGE_CONSUMER_NAME,
+            config.ENV_DATA["cluster_namespace"],
+            consumer_context,
+        )
+        storage_consumer_uid = storage_consumer.get_uid()
+        patch = json.dumps(
+            {"status": {"phase": "Connected", "id": storage_consumer_uid}}
+        )
+        cmd = f"oc patch storageclient ocs-storagecluster --subresource status --type merge -p '{patch}'"
+        exec_cmd(cmd)
+        waiting_time = 60
+        logger.info(f"Sleeping for {waiting_time} seconds to create Storage classes")
+        time.sleep(waiting_time)
     sc = OCS(**base_sc.data)
     return sc
 
@@ -868,7 +901,7 @@ def create_storage_class(
 def create_pvc(
     sc_name,
     pvc_name=None,
-    namespace=config.ENV_DATA["cluster_namespace"],
+    namespace=None,
     size=None,
     do_reload=True,
     access_mode=constants.ACCESS_MODE_RWO,
@@ -893,6 +926,7 @@ def create_pvc(
     Returns:
         PVC: PVC instance
     """
+    namespace = namespace or config.ENV_DATA["cluster_namespace"]
     pvc_data = templating.load_yaml(constants.CSI_PVC_YAML)
     pvc_data["metadata"]["name"] = (
         pvc_name if pvc_name else create_unique_resource_name("test", "pvc")
@@ -1089,7 +1123,7 @@ def get_cephfs_data_pool_name():
     return out[0]["data_pools"][0]
 
 
-def validate_cephfilesystem(fs_name, namespace=config.ENV_DATA["cluster_namespace"]):
+def validate_cephfilesystem(fs_name, namespace=None):
     """
     Verify CephFileSystem exists at Ceph and OCP
 
@@ -1100,6 +1134,7 @@ def validate_cephfilesystem(fs_name, namespace=config.ENV_DATA["cluster_namespac
         bool: True if CephFileSystem is created at Ceph and OCP side else
            will return False with valid msg i.e Failure cause
     """
+    namespace = namespace or config.ENV_DATA["cluster_namespace"]
     cfs = ocp.OCP(kind=constants.CEPHFILESYSTEM, namespace=namespace)
     ct_pod = pod.get_ceph_tools_pod()
     ceph_validate = False
@@ -1254,6 +1289,22 @@ def get_cephfs_name():
     ct_pod = pod.get_ceph_tools_pod()
     result = ct_pod.exec_ceph_cmd("ceph fs ls")
     return result[0]["name"]
+
+
+def get_cephfs_subvolumegroup_names():
+    """
+    Get all CephFS subvolume groups present in the cluster.
+
+    Returns:
+        list: Names of all CephFS subvolume groups
+
+    """
+    cephfs_name = config.ENV_DATA.get("cephfs_name") or get_cephfs_name()
+    ct_pod = pod.get_ceph_tools_pod()
+    subvolume_groups = ct_pod.exec_ceph_cmd(
+        ceph_cmd=f"ceph fs subvolumegroup ls {cephfs_name}", format=None
+    )
+    return [sg["name"] for sg in subvolume_groups]
 
 
 @retry(exceptions.CommandFailed, tries=5, delay=10, backoff=1)
@@ -2892,9 +2943,7 @@ def modify_osd_replica_count(resource_name, replica_count):
     return ocp_obj.patch(resource_name=resource_name, params=params)
 
 
-def modify_deployment_replica_count(
-    deployment_name, replica_count, namespace=config.ENV_DATA["cluster_namespace"]
-):
+def modify_deployment_replica_count(deployment_name, replica_count, namespace=None):
     """
     Function to modify deployment replica count,
     i.e to scale up or down deployment
@@ -2908,6 +2957,7 @@ def modify_deployment_replica_count(
         bool: True in case if changes are applied. False otherwise
 
     """
+    namespace = namespace or config.ENV_DATA["cluster_namespace"]
     ocp_obj = ocp.OCP(kind=constants.DEPLOYMENT, namespace=namespace)
     params = f'{{"spec": {{"replicas": {replica_count}}}}}'
     return ocp_obj.patch(resource_name=deployment_name, params=params)
@@ -2935,9 +2985,7 @@ def modify_deploymentconfig_replica_count(
     return dc_ocp_obj.patch(resource_name=deploymentconfig_name, params=params)
 
 
-def modify_job_parallelism_count(
-    job_name, count, namespace=config.ENV_DATA["cluster_namespace"]
-):
+def modify_job_parallelism_count(job_name, count, namespace=None):
     """
     Function to modify Job instances count,
 
@@ -2950,6 +2998,7 @@ def modify_job_parallelism_count(
         bool: True in case if changes are applied. False otherwise
 
     """
+    namespace = namespace or config.ENV_DATA["cluster_namespace"]
     ocp_obj = ocp.OCP(kind=constants.JOB, namespace=namespace)
     params = f'{{"spec": {{"parallelism": {count}}}}}'
     return ocp_obj.patch(resource_name=job_name, params=params)
@@ -3024,9 +3073,7 @@ def collect_performance_stats(dir_name):
         json.dump(performance_stats, outfile)
 
 
-def validate_pod_oomkilled(
-    pod_name, namespace=config.ENV_DATA["cluster_namespace"], container=None
-):
+def validate_pod_oomkilled(pod_name, namespace=None, container=None):
     """
     Validate pod oomkilled message are found on log
 
@@ -3043,6 +3090,7 @@ def validate_pod_oomkilled(
         Assertion if failed to fetch logs
 
     """
+    namespace = namespace or config.ENV_DATA["cluster_namespace"]
     rc = True
     try:
         pod_log = pod.get_pod_logs(
@@ -3205,10 +3253,13 @@ def default_volumesnapshotclass(interface_type):
         OCS: VolumeSnapshotClass Instance
     """
     external = config.DEPLOYMENT["external_mode"]
+    ocs_version = version.get_semantic_ocs_version_from_config()
+
     if interface_type == constants.CEPHBLOCKPOOL:
         if (
             config.ENV_DATA["platform"].lower()
             in constants.HCI_PROVIDER_CLIENT_PLATFORMS
+            and ocs_version <= version.VERSION_4_18
         ):
             sc_obj = OCP(kind=constants.STORAGECLASS)
             # TODO: Select based on storageclient name or namespace in case of multiple storageclients in a cluster
@@ -3234,6 +3285,7 @@ def default_volumesnapshotclass(interface_type):
         if (
             config.ENV_DATA["platform"].lower()
             in constants.HCI_PROVIDER_CLIENT_PLATFORMS
+            and ocs_version <= version.VERSION_4_18
         ):
             sc_obj = OCP(kind=constants.STORAGECLASS)
             # TODO: Select based on storageclient name or namespace in case of multiple storageclients in a cluster
@@ -3518,6 +3570,13 @@ def set_configmap_log_level_rook_ceph_operator(value):
         namespace=config.ENV_DATA["cluster_namespace"],
         resource_name=constants.ROOK_OPERATOR_CONFIGMAP,
     )
+    try:
+        configmap_obj.get()
+    except CommandFailed:
+        logger.warning(
+            f"Configmap {constants.ROOK_OPERATOR_CONFIGMAP} doesn't exist, creating it."
+        )
+        run_cmd(f"oc create -f {constants.ROOK_OPERATOR_CONFIGMAP_YAML}")
     logger.info(f"Setting ROOK_LOG_LEVEL to: {value}")
     ocs_version = version.get_semantic_ocs_version_from_config()
     if ocs_version >= version.VERSION_4_12:
@@ -3699,9 +3758,7 @@ def get_failure_domain():
     return storage_cluster_obj.data["items"][0]["status"]["failureDomain"]
 
 
-def modify_statefulset_replica_count(
-    statefulset_name, replica_count, namespace=config.ENV_DATA["cluster_namespace"]
-):
+def modify_statefulset_replica_count(statefulset_name, replica_count, namespace=None):
     """
     Function to modify statefulset replica count,
     i.e to scale up or down statefulset
@@ -3714,6 +3771,7 @@ def modify_statefulset_replica_count(
         bool: True in case if changes are applied. False otherwise
 
     """
+    namespace = namespace or config.ENV_DATA["cluster_namespace"]
     ocp_obj = OCP(kind=constants.STATEFULSET, namespace=namespace)
     params = f'{{"spec": {{"replicas": {replica_count}}}}}'
     return ocp_obj.patch(resource_name=statefulset_name, params=params)
@@ -3837,7 +3895,7 @@ def check_number_of_mon_pods(expected_mon_num=3):
     return False
 
 
-def get_secret_names(namespace=config.ENV_DATA["cluster_namespace"], resource_name=""):
+def get_secret_names(namespace=None, resource_name=""):
     """
     Get secrets names
 
@@ -3849,6 +3907,7 @@ def get_secret_names(namespace=config.ENV_DATA["cluster_namespace"], resource_na
         dict: secret names
 
     """
+    namespace = namespace or config.ENV_DATA["cluster_namespace"]
     logger.info(f"Get secret names on project {namespace}")
     secret_obj = ocp.OCP(kind=constants.SECRET, namespace=namespace)
     secrets_objs = secret_obj.get(resource_name=resource_name)
@@ -4265,7 +4324,7 @@ def get_cephfs_subvolumegroup():
     return subvolume_group_name
 
 
-def create_sa_token_secret(sa_name, namespace=config.ENV_DATA["cluster_namespace"]):
+def create_sa_token_secret(sa_name, namespace=None):
     """
     Creates a serviceaccount token secret
 
@@ -4317,6 +4376,42 @@ def get_mon_db_size_in_kb(mon_pod_obj):
     mon_db_size_kb = convert_device_size(size + "i", "KB")
     logger.info(f"mon-{mon_pod_label} DB size: {mon_db_size_kb} KB")
     return mon_db_size_kb
+
+
+def get_noobaa_db_usage_percent():
+    """
+    Get noobaa db usage percentage
+
+    Returns:
+        str: Noobaa db usage percentage
+
+    """
+    noobaa_db_pod_obj = pod.get_noobaa_pods(
+        noobaa_label=constants.NOOBAA_DB_LABEL_419_AND_ABOVE
+    )
+    cmd_out = noobaa_db_pod_obj[0].exec_cmd_on_pod(
+        command="df -h /var/lib/pgsql/", out_yaml_format=False
+    )
+    df_out = cmd_out.split()
+    return df_out[-2]
+
+
+def get_noobaa_db_size():
+    """
+    Get noobaa db size
+
+    Returns:
+        str: Noobaa db size
+
+    """
+    noobaa_db_pod_obj = pod.get_noobaa_pods(
+        noobaa_label=constants.NOOBAA_DB_LABEL_419_AND_ABOVE
+    )
+    cmd_out = noobaa_db_pod_obj[0].exec_cmd_on_pod(
+        command="df -h /var/lib/pgsql/", out_yaml_format=False
+    )
+    df_out = cmd_out.split()
+    return df_out[-5]
 
 
 def get_noobaa_db_used_space():
@@ -4513,6 +4608,24 @@ def verify_storagecluster_nodetopology():
     return ocs_node_names.sort() == nodes_storage_cluster.sort()
 
 
+def get_noobaa_metrics_token_from_secret():
+    """
+    Retrieve the JWT needed to authenticate NooBaa metrics queries
+    """
+
+    ocp_secret_obj = OCP(kind="secret", namespace=constants.OPENSHIFT_STORAGE_NAMESPACE)
+
+    noobaa_metrics_secret = ocp_secret_obj.get(
+        resource_name=constants.NOOBAA_METRICS_AUTH_SECRET
+    )
+
+    base64_metrics_auth_token = noobaa_metrics_secret["data"]["metrics_token"]
+
+    metrics_auth_token = base64.b64decode(base64_metrics_auth_token).decode("utf-8")
+
+    return metrics_auth_token
+
+
 def get_s3_credentials_from_secret(secret_name):
     ocp_secret_obj = OCP(kind="secret", namespace=config.ENV_DATA["cluster_namespace"])
 
@@ -4622,7 +4735,7 @@ def verify_log_exist_in_pods_logs(
     pod_names,
     expected_log,
     container=None,
-    namespace=config.ENV_DATA["cluster_namespace"],
+    namespace=None,
     all_containers_flag=True,
     since=None,
 ):
@@ -4641,6 +4754,7 @@ def verify_log_exist_in_pods_logs(
         bool: return True if log exist otherwise False
 
     """
+    namespace = namespace or config.ENV_DATA["cluster_namespace"]
     for pod_name in pod_names:
         pod_logs = pod.get_pod_logs(
             pod_name,
@@ -4668,26 +4782,64 @@ def retrieve_cli_binary(cli_type="mcg"):
     """
     semantic_version = version.get_semantic_ocs_version_from_config()
     ocs_build = get_ocs_build_number()
-    if cli_type == "odf" and semantic_version < version.VERSION_4_15:
-        raise NotSupportedException(
-            f"odf cli tool not supported on ODF {semantic_version}"
-        )
+    original_cli_type = cli_type
 
+    # For OCS >= 4.20, mcg-cli is no longer available, redirect to odf-cli
+    if semantic_version >= version.VERSION_4_20 and cli_type == "mcg":
+        logger.info(
+            f"OCS {semantic_version} >= 4.20 detected. MCG CLI is now part of ODF CLI. "
+            "Redirecting to download odf-cli instead."
+        )
+        cli_type = "odf"
+
+    # Use ODFCLIRetriever for odf-cli downloads
+    if cli_type == "odf":
+        from ocs_ci.helpers.odf_cli import ODFCLIRetriever
+
+        odf_retriever = ODFCLIRetriever()
+        odf_retriever.retrieve_odf_cli_binary()
+
+        # Create symlink for backward compatibility if mcg was originally requested
+        if original_cli_type == "mcg" and semantic_version >= version.VERSION_4_20:
+            mcg_cli_path = constants.NOOBAA_OPERATOR_LOCAL_CLI_PATH
+            odf_cli_path = odf_retriever.local_cli_path
+            if os.path.exists(mcg_cli_path) or os.path.islink(mcg_cli_path):
+                os.remove(mcg_cli_path)
+            os.symlink(odf_cli_path, mcg_cli_path)
+            logger.info(
+                f"Created symlink from {mcg_cli_path} to {odf_cli_path} for backward compatibility"
+            )
+        return
+
+    # Continue with original mcg-cli download logic for OCS < 4.20
     remote_path = get_architecture_path(cli_type)
     remote_cli_basename = os.path.basename(remote_path)
-    if cli_type == "mcg":
+
+    # Set the local path based on the actual CLI being downloaded
+    if cli_type == "odf":
+        local_cli_path = constants.ODF_CLI_LOCAL_PATH
+    else:
         local_cli_path = constants.NOOBAA_OPERATOR_LOCAL_CLI_PATH
-    elif cli_type == "odf":
-        local_cli_path = os.path.join(config.RUN["bin_dir"], "odf-cli")
     local_cli_dir = os.path.dirname(local_cli_path)
     live_deployment = config.DEPLOYMENT["live_deployment"]
+
+    # Determine which image to use based on version and CLI type
     if live_deployment and semantic_version >= version.VERSION_4_13:
         if semantic_version >= version.VERSION_4_15:
-            image = f"{constants.ODF_CLI_OFFICIAL_IMAGE}:v{semantic_version}.0"
+            image = f"{constants.ODF_CLI_OFFICIAL_IMAGE}:v{semantic_version}"
         else:
             image = f"{constants.MCG_CLI_OFFICIAL_IMAGE}:v{semantic_version}"
     else:
-        image = f"{constants.MCG_CLI_DEV_IMAGE}:{ocs_build}"
+        # Development builds
+        if semantic_version >= version.VERSION_4_20:
+            # For 4.20+ dev builds, always use ODF CLI
+            image = f"{constants.ODF_CLI_DEV_IMAGE}:{ocs_build}"
+        elif cli_type == "odf" and semantic_version >= version.VERSION_4_15:
+            # For 4.15+ dev builds requesting odf-cli
+            image = f"{constants.ODF_CLI_DEV_IMAGE}:{ocs_build}"
+        else:
+            # For older versions or mcg-cli requests in dev
+            image = f"{constants.MCG_CLI_DEV_IMAGE}:{ocs_build}"
 
     pull_secret_path = download_pull_secret()
     exec_cmd(
@@ -4845,9 +4997,7 @@ def is_rbd_default_storage_class(sc_name=None):
     return False
 
 
-def get_network_attachment_definitions(
-    nad_name, namespace=config.ENV_DATA["cluster_namespace"]
-):
+def get_network_attachment_definitions(nad_name, namespace=None):
     """
     Get NetworkAttachmentDefinition obj
 
@@ -4858,6 +5008,7 @@ def get_network_attachment_definitions(
         network_attachment_definitions (obj) : network_attachment_definitions object
 
     """
+    namespace = namespace or config.ENV_DATA["cluster_namespace"]
     return OCP(
         kind=constants.NETWORK_ATTACHEMENT_DEFINITION,
         namespace=namespace,
@@ -4967,11 +5118,10 @@ def configure_node_network_configuration_policy_on_all_worker_nodes():
     Configure NodeNetworkConfigurationPolicy CR on each worker node in cluster
 
     """
-    from ocs_ci.ocs.node import get_worker_nodes
 
     # This function require changes for compact mode
     logger.info("Configure NodeNetworkConfigurationPolicy on all worker nodes")
-    worker_node_names = get_worker_nodes()
+    worker_node_names = node.get_worker_nodes()
     ip_version = "ipv4"
     if (
         config.DEPLOYMENT.get("ipv6")
@@ -5074,11 +5224,11 @@ def restart_node_if_debug_doesnt_work(worker_node_name):
         factory = platform_nodes.PlatformNodesFactory()
         nodes = factory.get_nodes_platform()
         nodes.restart_nodes_by_stop_and_start(node_to_restart)
-        wait_for_nodes_status([worker_node_name], constants.NODE_READY)
+        node.wait_for_nodes_status([worker_node_name], constants.NODE_READY)
         oc_cmd.exec_oc_debug_cmd(node=worker_node_name, cmd_list=[cmd])
 
 
-def get_daemonsets_names(namespace=config.ENV_DATA["cluster_namespace"]):
+def get_daemonsets_names(namespace=None):
     """
     Get all daemonspaces in namespace
 
@@ -5089,6 +5239,7 @@ def get_daemonsets_names(namespace=config.ENV_DATA["cluster_namespace"]):
         list: all daemonset names in the namespace
 
     """
+    namespace = namespace or config.ENV_DATA["cluster_namespace"]
     daemonset_names = list()
     daemonset_objs = OCP(
         kind=constants.DAEMONSET,
@@ -5099,7 +5250,7 @@ def get_daemonsets_names(namespace=config.ENV_DATA["cluster_namespace"]):
     return daemonset_names
 
 
-def get_daemonsets_obj(name, namespace=config.ENV_DATA["cluster_namespace"]):
+def get_daemonsets_obj(name, namespace=None):
     """
     Get daemonset obj
     Args:
@@ -5110,6 +5261,7 @@ def get_daemonsets_obj(name, namespace=config.ENV_DATA["cluster_namespace"]):
         ocp_obj: daemonset ocp obj
 
     """
+    namespace = namespace or config.ENV_DATA["cluster_namespace"]
     return OCP(kind=constants.DAEMONSET, namespace=namespace, resource_name=name)
 
 
@@ -5553,7 +5705,7 @@ def apply_custom_taint_and_toleration(taint_label="xyz"):
     """
     Apply custom taints and tolerations.
     1. Taint ocs nodes with non-ocs taint
-    2. Set custom tolerations on storagecluster, subscription, configmap and ocsinit
+    2. Set custom tolerations on storagecluster, subscription, configmap, ocsinit and drivers
 
     Args:
         taint_label (str): The taint label to apply (default is "xyz").
@@ -5604,10 +5756,26 @@ def apply_custom_taint_and_toleration(taint_label="xyz"):
                 f'"csi-provisioner": {tolerations}, "mds": {tolerations}, "metrics-exporter": {tolerations}, '
                 f'"noobaa-core": {tolerations}, "rgw": {tolerations}, "toolbox": {tolerations}'
             )
-        param = f'{{"spec": {{"placement": {{{param}}}}}}}'
+            param = f'{{"spec": {{"placement": {{{param}}}}}}}'
 
     storagecluster_obj.patch(params=param, format_type="merge")
     logger.info(f"Successfully added toleration to {storagecluster_obj.kind}")
+    # Add tolerations to CSI drivers for OCS version >= 4.19
+    if version.get_semantic_ocs_version_from_config() >= version.VERSION_4_19:
+        logger.info("Add tolerations to all CSI drivers")
+        driver_obj = ocp.OCP(
+            kind=constants.DRIVER,
+            namespace=config.ENV_DATA["cluster_namespace"],
+        )
+        driver_list = ocp.get_all_resource_names_of_a_kind(
+            kind=constants.DRIVER,
+        )
+        for driver_name in driver_list:
+            param = f'{{"spec": {{"controllerPlugin": {tolerations}, "nodePlugin": {tolerations}}}}}'
+            driver_obj.patch(
+                resource_name=driver_name, params=param, format_type="merge"
+            )
+            logger.info(f"Successfully added tolerations to CSI driver {driver_name}")
 
     logger.info("Add tolerations to the subscription")
     sub_list = ocp.get_all_resource_names_of_a_kind(kind=constants.SUBSCRIPTION)
@@ -5674,6 +5842,73 @@ def apply_custom_taint_and_toleration(taint_label="xyz"):
             )
             for pod_obj in pod_list:
                 pod_obj.delete(wait=False)
+
+
+def remove_toleration():
+    """
+    Remove toleration on storagecluster, subscription and drivers
+
+    Returns:
+        bool: True if all operations succeed, otherwise False.
+
+    """
+    success = True
+    resource_name = constants.DEFAULT_CLUSTERNAME
+    if config.DEPLOYMENT["external_mode"]:
+        resource_name = constants.DEFAULT_CLUSTERNAME_EXTERNAL_MODE
+    logger.info("Remove tolerations from storagecluster")
+    storagecluster_obj = ocp.OCP(
+        resource_name=resource_name,
+        namespace=config.ENV_DATA["cluster_namespace"],
+        kind=constants.STORAGECLUSTER,
+    )
+    params = '[{"op": "remove", "path": "/spec/placement"}]'
+    result = storagecluster_obj.patch(params=params, format_type="json")
+    if not result:
+        logger.error("Failed to remove toleration from storagecluster")
+        success = False
+    logger.info("Remove tolerations from subscriptions")
+
+    sub_list = ocp.get_all_resource_names_of_a_kind(kind=constants.SUBSCRIPTION)
+    sub_obj = ocp.OCP(
+        namespace=config.ENV_DATA["cluster_namespace"],
+        kind=constants.SUBSCRIPTION,
+    )
+    for sub in sub_list:
+        subscription_data = sub_obj.get(resource_name=sub)
+        if "config" in subscription_data.get("spec", {}):
+            params = '[{"op": "remove", "path": "/spec/config"}]'
+            result = sub_obj.patch(resource_name=sub, params=params, format_type="json")
+            if not result:
+                logger.error(f"Failed to remove toleration from subscription {sub}")
+                success = False
+
+    if version.get_semantic_ocs_version_from_config() >= version.VERSION_4_19:
+        logger.info("Removing tolerations from all CSI drivers")
+        driver_obj = ocp.OCP(
+            kind=constants.DRIVER,
+            namespace=config.ENV_DATA["cluster_namespace"],
+        )
+        driver_list = ocp.get_all_resource_names_of_a_kind(kind=constants.DRIVER)
+        for driver_name in driver_list:
+            params = (
+                '[{"op": "remove", "path": "/spec/controllerPlugin/tolerations"},'
+                '{"op": "remove", "path": "/spec/nodePlugin/tolerations"}]'
+            )
+            result = driver_obj.patch(
+                resource_name=driver_name, params=params, format_type="json"
+            )
+            if result:
+                logger.info(
+                    f"Successfully removed tolerations from CSI driver {driver_name}"
+                )
+            else:
+                logger.error(
+                    f"Failed to remove tolerations from CSI driver {driver_name}"
+                )
+                success = False
+
+    return success
 
 
 def get_reclaimspacecronjob_for_pvc(pvc_obj):
@@ -6037,6 +6272,20 @@ def find_cephfilesystemsubvolumegroup(storageclient_uid=None):
     return cephbfssubvolumegroup
 
 
+def remove_port_from_url(url):
+    """
+    Remove the port from a URL while preserving the scheme, hostname, and path.
+    Args:
+        url (str): The URL to sanitize.
+    Returns:
+        str: The URL without any port information.
+    """
+    parsed = urlparse(url)
+    # hostname is netloc without the port suffix
+    # i.e parsed.netloc='example.com:80'; parsed.hostname='example.com'
+    return urlunparse(parsed._replace(netloc=parsed.hostname))
+
+
 def set_configmap_log_level_csi_sidecar(value):
     """
     Set CSI_SIDECAR log level on configmap of rook-ceph-operator
@@ -6090,14 +6339,20 @@ def create_network_fence_class():
         )
 
     logger.info("Verifying CsiAddonsNode object for CSI RBD daemonset")
-    all_nodes = get_worker_nodes()
+    all_nodes = node.get_worker_nodes()
 
-    for node_name in all_nodes:
-        cidrs = get_rbd_daemonset_csi_addons_node_object(node_name)["status"][
-            "networkFenceClientStatus"
-        ][0]["ClientDetails"][0]["cidrs"]
-        assert len(cidrs) == 1, "No cidrs are populated to CSI Addons node object"
-        logger.info(f"Cidr: {cidrs[0]} populated in {node_name} CSI addons node object")
+    @retry(KeyError, tries=3, delay=5)
+    def _verify_csi_addons_objects():
+        for node_name in all_nodes:
+            cidrs = get_rbd_daemonset_csi_addons_node_object(node_name)["status"][
+                "networkFenceClientStatus"
+            ][0]["ClientDetails"][0]["cidrs"]
+            assert len(cidrs) == 1, "No cidrs are populated to CSI Addons node object"
+            logger.info(
+                f"Cidr: {cidrs[0]} populated in {node_name} CSI addons node object"
+            )
+
+    _verify_csi_addons_objects()
 
 
 def create_network_fence(node_name, cidr):
@@ -6166,3 +6421,128 @@ def unfence_node(node_name, delete=False):
             logger.info(f"Deleted network fence object for node {node_name}")
     else:
         logger.info(f"No networkfence found for node {node_name}")
+
+
+def create_auto_scaler(
+    name=None,
+    namespace=None,
+    sc_name=None,
+    device_class=None,
+    capacity_limit="8Ti",
+    scaling_threshold=70,
+    max_osd_size="8Ti",
+    timeout=1800,
+):
+    """
+    Create a StorageAutoScaler custom resource in OpenShift.
+
+    Args:
+        name (str): Name of the StorageAutoScaler resource.
+        namespace (str): Namespace where the resource is created.
+        sc_name (str): Name of the StorageCluster to attach to.
+        device_class (str): Device class for OSDs.
+        capacity_limit (str): Maximum total capacity before scaling stops.
+        scaling_threshold (int): Percent usage to trigger auto-scaling.
+        max_osd_size (str): Size of each OSD added during scaling.
+        timeout (int): Timeout in seconds for a scaling operation.
+
+    Returns:
+        OCS: An OCS instance of the StorageAutoScaler
+    """
+    from ocs_ci.ocs.resources.storage_cluster import (
+        get_storage_cluster,
+        get_default_deviceclass,
+    )
+
+    namespace = namespace or config.ENV_DATA["cluster_namespace"]
+    if not sc_name:
+        sc = get_storage_cluster(namespace)
+        sc_items = sc.data.get("items")
+        if not sc_items:
+            logger.warning(
+                f"The storagecluster doesn't contain any items. Fall back to the default "
+                f"storagecluster name '{constants.DEFAULT_STORAGE_CLUSTER}'"
+            )
+            sc_name = constants.DEFAULT_STORAGE_CLUSTER
+        else:
+            sc_name = sc_items[0].get("metadata", {}).get("name")
+            if not sc_name:
+                logger.warning(
+                    f"Didn't find the storagecluster name. Fall back to the default "
+                    f"storagecluster name '{constants.DEFAULT_STORAGE_CLUSTER}'"
+                )
+                sc_name = constants.DEFAULT_STORAGE_CLUSTER
+
+    device_class = device_class or get_default_deviceclass()
+    name = name or f"{sc_name}-{device_class}"
+
+    resource_dict = {
+        "apiVersion": "ocs.openshift.io/v1",
+        "kind": "StorageAutoScaler",
+        "metadata": {"name": name, "namespace": namespace},
+        "spec": {
+            "storageCluster": {"name": sc_name},
+            "deviceClass": device_class,
+            "storageCapacityLimit": capacity_limit,
+            "storageScalingThresholdPercent": scaling_threshold,
+            "maxOsdSize": max_osd_size,
+            "timeoutSeconds": timeout,
+        },
+    }
+
+    auto_scaler_obj = create_resource(**resource_dict)
+    return auto_scaler_obj
+
+
+def get_provisioner_label(interface):
+    """
+    Identify the csi provisioner label based on deployment mode and version
+
+    Args:
+        interface(str): CephFileSystem or CephBlockPool
+
+    Returns:
+        str: Label of the pod
+    """
+
+    if (
+        config.ENV_DATA["platform"].lower() in constants.HCI_PROVIDER_CLIENT_PLATFORMS
+        or version.get_semantic_ocs_version_from_config() >= version.VERSION_4_19
+    ):
+        if interface == constants.CEPHFILESYSTEM:
+            label = constants.CEPHFS_CTRLPLUGIN_LABEL
+        elif interface == constants.CEPHBLOCKPOOL:
+            label = constants.RBD_CTRLPLUGIN_LABEL
+    else:
+        if interface == constants.CEPHFILESYSTEM:
+            label = constants.CSI_CEPHFSPLUGIN_PROVISIONER_LABEL
+        elif interface == constants.CEPHBLOCKPOOL:
+            label = constants.CSI_RBDPLUGIN_PROVISIONER_LABEL
+    return label
+
+
+def get_node_plugin_label(interface):
+    """
+    Identify the csi plugin label based on deployment mode and version
+
+    Args:
+        interface(str): CephFileSystem or CephBlockPool
+
+    Returns:
+        str: Label of the pod
+    """
+
+    if (
+        config.ENV_DATA["platform"].lower() in constants.HCI_PROVIDER_CLIENT_PLATFORMS
+        or version.get_semantic_ocs_version_from_config() >= version.VERSION_4_19
+    ):
+        if interface == constants.CEPHFILESYSTEM:
+            label = constants.CEPHFS_NODEPLUGIN_LABEL
+        elif interface == constants.CEPHBLOCKPOOL:
+            label = constants.RBD_NODEPLUGIN_LABEL
+    else:
+        if interface == constants.CEPHFILESYSTEM:
+            label = constants.CSI_CEPHFSPLUGIN_LABEL
+        elif interface == constants.CEPHBLOCKPOOL:
+            label = constants.CSI_RBDPLUGIN_LABEL
+    return label

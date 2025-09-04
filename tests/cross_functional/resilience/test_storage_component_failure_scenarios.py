@@ -2,7 +2,11 @@ import logging
 import pytest
 
 from ocs_ci.ocs import constants
-from ocs_ci.framework.pytest_customization.marks import green_squad, resiliency
+from ocs_ci.framework.pytest_customization.marks import (
+    green_squad,
+    resiliency,
+    polarion_id,
+)
 from ocs_ci.resiliency.resiliency_helper import Resiliency
 
 log = logging.getLogger(__name__)
@@ -10,7 +14,7 @@ log = logging.getLogger(__name__)
 
 @green_squad
 @resiliency
-class TestPlatformFailureScenarios:
+class TestStorageClusterComponentFailurescenarios:
     def _prepare_pvcs_and_workloads(
         self, project_factory, multi_pvc_factory, resiliency_workload
     ):
@@ -60,72 +64,67 @@ class TestPlatformFailureScenarios:
         log.info("All workloads passed after failure injection.")
 
     @pytest.mark.parametrize(
-        "failure_case",
-        [
-            "PLATFORM_INSTANCE_FAILURES",
-            "PLATFORM_NETWORK_FAILURES",
-            "PLATFORM_NETWORK_FAULTS",
+        argnames=["scenario_name", "failure_case"],
+        argvalues=[
+            pytest.param(
+                "STORAGECLUSTER_COMPONENT_FAILURES",
+                "OSD_POD_FAILURES",
+                marks=polarion_id("OCS-6821"),
+            ),
+            pytest.param(
+                "STORAGECLUSTER_COMPONENT_FAILURES",
+                "MGR_POD_FAILURES",
+                marks=polarion_id("OCS-6823"),
+            ),
+            pytest.param(
+                "STORAGECLUSTER_COMPONENT_FAILURES",
+                "MDS_POD_FAILURES",
+                marks=polarion_id("OCS-6850"),
+            ),
+            pytest.param(
+                "STORAGECLUSTER_COMPONENT_FAILURES",
+                "MON_POD_FAILURES",
+                marks=polarion_id("OCS-6822"),
+            ),
+            pytest.param(
+                "STORAGECLUSTER_COMPONENT_FAILURES",
+                "RGW_POD_FAILURES",
+                marks=polarion_id("OCS-6808"),
+            ),
+            pytest.param(
+                "STORAGECLUSTER_COMPONENT_FAILURES",
+                "CEPHFS_POD_FAILURES",
+                marks=polarion_id("OCS-6808"),
+            ),
         ],
     )
-    def test_platform_failure_scenarios(
+    def test_storage_component_failure_scenarios(
         self,
+        scenario_name,
         failure_case,
-        platfrom_failure_scenarios,
         project_factory,
         multi_pvc_factory,
         resiliency_workload,
     ):
         """
-        Parametrized test that validates resiliency of the platform
-        against various failure scenarios while workloads are running.
+        Test that validates ODF platform resiliency under application component
+        failures while I/O workloads are actively running.
 
-        Args:
-            failure_case (str): The failure method to inject.
+        Steps:
+        1. Create a mix of CephFS and RBD PVCs with multiple access modes.
+        2. Deploy FIO-based workloads on these PVCs.
+        3. Inject specific failure scenario (e.g., OSD, MGR, MDS pod deletion).
+        4. Verify workloads continue to function without I/O errors post recovery.
+        5. Clean up workloads and verify system stability.
+
         """
-        scenario = platfrom_failure_scenarios.get("SCENARIO_NAME")
-        log.info(f"Running Scenario: {scenario}, Failure Case: {failure_case}")
+        log.info(f"Running Scenario: {scenario_name}, Failure Case: {failure_case}")
 
         workloads = self._prepare_pvcs_and_workloads(
             project_factory, multi_pvc_factory, resiliency_workload
         )
 
-        resiliency_runner = Resiliency(scenario, failure_method=failure_case)
-        resiliency_runner.start()
-        resiliency_runner.cleanup()
-
-        self._validate_and_cleanup_workloads(workloads)
-
-    @pytest.mark.parametrize(
-        "failure_case",
-        [
-            "PLATFORM_INSTANCE_FAILURES",
-            "PLATFORM_NETWORK_FAILURES",
-        ],
-    )
-    def test_platform_failures_with_stress(
-        self,
-        failure_case,
-        platfrom_failure_scenarios,
-        project_factory,
-        multi_pvc_factory,
-        resiliency_workload,
-        run_platform_stress,
-    ):
-        """
-        Validates platform resiliency under stress conditions
-        like high CPU, memory, I/O, and network load.
-        Ensures workloads continue running during failure scenarios.
-        """
-        scenario = platfrom_failure_scenarios.get("SCENARIO_NAME")
-        log.info(f"Running Scenario: {scenario}, Failure Case: {failure_case}")
-
-        workloads = self._prepare_pvcs_and_workloads(
-            project_factory, multi_pvc_factory, resiliency_workload
-        )
-
-        run_platform_stress()
-
-        resiliency_runner = Resiliency(scenario, failure_method=failure_case)
+        resiliency_runner = Resiliency(scenario_name, failure_method=failure_case)
         resiliency_runner.start()
         resiliency_runner.cleanup()
 

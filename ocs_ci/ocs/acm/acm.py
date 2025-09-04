@@ -9,8 +9,10 @@ from selenium.webdriver.support import expected_conditions as ec
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import (
     NoSuchElementException,
+    TimeoutException,
 )
 
+from ocs_ci.helpers.dr_helpers import get_cluster_set_name
 from ocs_ci.helpers.helpers import create_unique_resource_name
 from ocs_ci.ocs import constants
 from ocs_ci.ocs.acm.acm_constants import (
@@ -40,6 +42,7 @@ from ocs_ci.ocs.ui.acm_ui import AcmPageNavigator
 from ocs_ci.ocs.ui.base_ui import (
     login_ui,
     SeleniumDriver,
+    wait_for_element_to_be_clickable,
 )
 from ocs_ci.utility.version import compare_versions
 from ocs_ci.utility import version
@@ -159,6 +162,10 @@ class AcmAddClusters(AcmPageNavigator):
         Args:
             globalnet (bool): Globalnet is set to True by default for ODF versions greater than or equal to 4.13
 
+        Returns:
+            str: cluster set name created during the function to which managed clusters are tied for Submariner
+            installation
+
         """
         ocs_version = version.get_semantic_ocs_version_from_config()
 
@@ -171,38 +178,7 @@ class AcmAddClusters(AcmPageNavigator):
         ][0]
         # submariner catalogsource creation
         if config.ENV_DATA.get("submariner_release_type") == "unreleased":
-            submariner_downstream_unreleased = templating.load_yaml(
-                constants.SUBMARINER_DOWNSTREAM_UNRELEASED
-            )
-            # Update catalog source
-            submariner_full_url = "".join(
-                [
-                    constants.SUBMARINER_DOWNSTREAM_UNRELEASED_BUILD_URL,
-                    config.ENV_DATA["submariner_version"],
-                ]
-            )
-
-            version_tag = config.ENV_DATA.get("submariner_unreleased_image", None)
-            if version_tag is None:
-                resp = requests.get(submariner_full_url, verify=False)
-                raw_msg = resp.json()["raw_messages"]
-                version_tag = raw_msg[0]["msg"]["pipeline"]["index_image"][
-                    f"v{get_ocp_version()}"
-                ].split(":")[1]
-            submariner_downstream_unreleased["spec"]["image"] = ":".join(
-                [constants.SUBMARINER_BREW_REPO, version_tag]
-            )
-            submariner_data_yaml = tempfile.NamedTemporaryFile(
-                mode="w+", prefix="submariner_downstream_unreleased", delete=False
-            )
-            templating.dump_data_to_temp_yaml(
-                submariner_downstream_unreleased, submariner_data_yaml.name
-            )
-            old_ctx = config.cur_index
-            for cluster in get_non_acm_cluster_config():
-                config.switch_ctx(cluster.MULTICLUSTER["multicluster_index"])
-                run_cmd(f"oc create -f {submariner_data_yaml.name}", timeout=300)
-            config.switch_ctx(old_ctx)
+            self.create_submariner_downstream_unreleased_catalogsource()
 
         cluster_name_a = cluster_env.get(f"cluster_name_{primary_index}")
         cluster_name_b = cluster_env.get(f"cluster_name_{secondary_index}")
@@ -300,19 +276,24 @@ class AcmAddClusters(AcmPageNavigator):
         self.take_screenshot()
         log.info("Click on 'Install'")
         self.do_click(self.page_nav["install-btn"])
+        return cluster_set_name
 
     def submariner_unreleased_downstream_info(self):
+        log.info("Use custom Submariner subscription ")
         self.do_click(self.page_nav["submariner-custom-subscription"])
+        log.info("Clear existing Source")
         self.do_clear(self.page_nav["submariner-custom-source"])
+        log.info("Send submariner-catalogsource as Source")
         self.do_send_keys(
             self.page_nav["submariner-custom-source"], "submariner-catalogsource"
         )
         submariner_unreleased_channel = (
-            config.ENV_DATA["submariner_unreleased_channel"]
-            if config.ENV_DATA["submariner_unreleased_channel"]
-            else config.ENV_DATA["submariner_version"].rpartition(".")[0]
+            config.ENV_DATA.get("submariner_unreleased_channel")
+            if config.ENV_DATA.get("submariner_unreleased_channel")
+            else config.ENV_DATA.get("submariner_version").rpartition(".")[0]
         )
         channel_name = "stable-" + submariner_unreleased_channel
+        log.info("Send Channel")
         self.do_send_keys(
             self.page_nav["submariner-custom-channel"],
             channel_name,
@@ -337,6 +318,7 @@ class AcmAddClusters(AcmPageNavigator):
         else:
             log.error("Couldn't navigate to Cluster sets page")
             raise NoSuchElementException
+        cluster_set_name = get_cluster_set_name()[0]
         log.info("Click on the cluster set created")
         self.do_click(
             format_locator(self.page_nav["cluster-set-selection"], cluster_set_name)
@@ -378,6 +360,137 @@ class AcmAddClusters(AcmPageNavigator):
         ), "Second gateway node label check did not pass for Submariner"
         self.take_screenshot()
         log.info("Submariner is healthy, check passed")
+
+    def install_submariner_cli(self, globalnet=True):
+        """
+        Installs the Submariner Via CLI on the ACM Hub cluster and expects 2 OCP clusters to be already imported
+        on the Hub Cluster to create a link between them
+
+        Args:
+            globalnet (bool): Globalnet is set to True by default for ODF versions greater than or equal to 4.13
+
+        """
+        if config.ENV_DATA.get("submariner_release_type") == "unreleased":
+            self.create_submariner_downstream_unreleased_catalogsource()
+        submariner_broker_yaml = templating.load_yaml(constants.SUBMARINER_BROKER_YAML)
+        all_documents = []
+        log.info("Creating ManagedClusterSet")
+        global cluster_set_name
+        cluster_set_name = create_unique_resource_name("submariner", "clusterset")
+        log.info(f"Clusterset created with name: {cluster_set_name}")
+        cluster_set_yaml = templating.load_yaml(constants.CLUSTERSET_YAML)
+        cluster_set_yaml["metadata"]["name"] = cluster_set_name
+        clusterset_file = tempfile.NamedTemporaryFile(
+            mode="w+", prefix="clusterset", delete=False
+        )
+        templating.dump_data_to_temp_yaml(cluster_set_yaml, clusterset_file.name)
+        old_ctx = config.cur_index
+        config.switch_acm_ctx()
+        run_cmd(cmd=f"oc create -f {clusterset_file.name}")
+        managed_clusters = OCP(kind=constants.ACM_MANAGEDCLUSTER).get().get("items", [])
+        # ignore local-cluster here
+        for i in managed_clusters:
+            managed_cluster_name = i["metadata"]["name"]
+            if managed_cluster_name != constants.ACM_LOCAL_CLUSTER:
+                run_cmd(
+                    cmd=f"oc label {constants.ACM_MANAGEDCLUSTER} {managed_cluster_name} "
+                    f"cluster.open-cluster-management.io/clusterset={cluster_set_name} --overwrite"
+                )
+
+        config.switch_ctx(old_ctx)
+
+        for cluster in get_non_acm_cluster_config():
+            submariner_addon_yaml = templating.load_yaml(
+                constants.SUBMARINER_ADDON_YAML
+            )
+            submariner_config_yaml = templating.load_yaml(
+                constants.SUBMARINER_CONFIG_YAML
+            )
+
+            config.switch_ctx(cluster.MULTICLUSTER["multicluster_index"])
+
+            submariner_addon_yaml["metadata"]["namespace"] = cluster.ENV_DATA[
+                "cluster_name"
+            ]
+            submariner_config_yaml["metadata"]["namespace"] = cluster.ENV_DATA[
+                "cluster_name"
+            ]
+            if config.ENV_DATA.get("submariner_release_type") == "unreleased":
+                submariner_unreleased_channel = (
+                    config.ENV_DATA.get("submariner_unreleased_channel")
+                    if config.ENV_DATA.get("submariner_unreleased_channel")
+                    else config.ENV_DATA.get("submariner_version").rpartition(".")[0]
+                )
+                channel_name = "stable-" + submariner_unreleased_channel
+                subscription_config = {
+                    "source": "submariner-catalogsource",
+                    "sourceNamespace": "openshift-marketplace",
+                    "channel": channel_name,
+                    "startingCSV": None,
+                    "installPlanApproval": "automatic",
+                }
+                submariner_config_yaml["spec"][
+                    "subscriptionConfig"
+                ] = subscription_config
+
+            all_documents.append(submariner_addon_yaml)
+            all_documents.append(submariner_config_yaml)
+        if not globalnet:
+            submariner_broker_yaml["spec"]["globalnetEnabled"] = "false"
+        submariner_broker_yaml["metadata"]["namespace"] = cluster_set_name + "-broker"
+        all_documents.append(submariner_broker_yaml)
+
+        # Create the temp file
+        submariner_data_file = tempfile.NamedTemporaryFile(
+            mode="w+", prefix="submariner_install_data", delete=False
+        )
+
+        # Dump all docs at once to preserve them
+        templating.dump_data_to_temp_yaml(all_documents, submariner_data_file.name)
+
+        log.info(f"YAML written to: {submariner_data_file.name}")
+
+        old_ctx = config.cur_index
+        config.switch_acm_ctx()
+        run_cmd(cmd=f"oc create -f {submariner_data_file.name}")
+
+    def create_submariner_downstream_unreleased_catalogsource(self):
+        """
+        Create Catalogsource for installing Downstream Unreleased Submariner
+
+        """
+        submariner_downstream_unreleased = templating.load_yaml(
+            constants.SUBMARINER_DOWNSTREAM_UNRELEASED
+        )
+        # Update catalog source
+        submariner_full_url = "".join(
+            [
+                constants.SUBMARINER_DOWNSTREAM_UNRELEASED_BUILD_URL,
+                config.ENV_DATA["submariner_version"],
+            ]
+        )
+
+        version_tag = config.ENV_DATA.get("submariner_unreleased_image", None)
+        if version_tag is None:
+            resp = requests.get(submariner_full_url, verify=False)
+            raw_msg = resp.json()["raw_messages"]
+            version_tag = raw_msg[0]["msg"]["pipeline"]["index_image"][
+                f"v{get_ocp_version()}"
+            ].split(":")[1]
+        submariner_downstream_unreleased["spec"]["image"] = ":".join(
+            [constants.BREW_REPO, version_tag]
+        )
+        submariner_data_yaml = tempfile.NamedTemporaryFile(
+            mode="w+", prefix="submariner_downstream_unreleased", delete=False
+        )
+        templating.dump_data_to_temp_yaml(
+            submariner_downstream_unreleased, submariner_data_yaml.name
+        )
+        old_ctx = config.cur_index
+        for cluster in get_non_acm_cluster_config():
+            config.switch_ctx(cluster.MULTICLUSTER["multicluster_index"])
+            run_cmd(f"oc apply -f {submariner_data_yaml.name}", timeout=300)
+        config.switch_ctx(old_ctx)
 
 
 def copy_kubeconfig(file=None, return_str=False):
@@ -453,8 +566,28 @@ def login_to_acm():
     log.info(f"URL: {url}")
     driver = login_ui(url)
     page_nav = AcmPageNavigator()
-    if not compare_versions(cmp_str):
-        page_nav.navigate_from_ocp_to_acm_cluster_page()
+    page_nav.page_has_loaded(retries=10, sleep_time=5)
+    for expected_text in ["local-cluster", "Administrator"]:
+        try:
+            dropdown_found = page_nav.wait_until_expected_text_is_found(
+                locator=page_nav.acm_page_nav["click-local-cluster"],
+                expected_text=expected_text,
+                timeout=15,
+            )
+            if dropdown_found:
+                log.info(
+                    f"'{expected_text}' dropdown found, navigating from OCP to ACM console"
+                )
+                page_nav.navigate_from_ocp_to_acm_cluster_page()
+                break
+            else:
+                log.warning(f"'{expected_text}' dropdown not found")
+        except (NoSuchElementException, TimeoutException) as e:
+            log.warning(f"Exception occurred while finding '{expected_text}': {e}")
+    else:
+        log.warning(
+            "Neither 'local-cluster' nor 'Administrator' dropdown found, view is already on ACM console"
+        )
 
     if compare_versions(cmp_str):
         page_title = ACM_PAGE_TITLE_2_7_ABOVE
@@ -462,6 +595,17 @@ def login_to_acm():
         page_title = ACM_PAGE_TITLE
     validate_page_title(title=page_title)
     log.info("Successfully logged into RHACM console")
+    side_navigation_toggle_btn = wait_for_element_to_be_clickable(
+        page_nav.acm_page_nav["side_navigation_toggle"]
+    )
+    side_navigation_toggle = page_nav.is_expanded(
+        locator=page_nav.acm_page_nav["side_navigation_toggle"]
+    )
+    if not side_navigation_toggle:
+        page_nav.driver.execute_script(
+            "arguments[0].click();", side_navigation_toggle_btn
+        )
+        log.info("Successfully expanded side navigation options on the ACM hub console")
     return driver
 
 

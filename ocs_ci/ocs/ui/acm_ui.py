@@ -8,6 +8,9 @@ from selenium.webdriver.common.by import By
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.support.wait import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
 from ocs_ci.deployment import vmware
 from ocs_ci.ocs import constants
 from ocs_ci.ocs.exceptions import ACMClusterDeployException
@@ -66,28 +69,63 @@ class AcmPageNavigator(BaseUI):
         self.choose_expanded_mode(mode=True, locator=self.acm_page_nav["Home"])
         self.do_click(locator=self.acm_page_nav["Overview_page"])
 
-    def navigate_clusters_page(self, timeout=120):
+    def navigate_clusters_page(self, timeout=120, vms=False):
         """
         Navigate to ACM Clusters Page
 
+        Args:
+            timeout (int): Timeout for which an element presence should be checked
+            vms (bool): False by default, if True, navigation happens on the Virtual machines page under Infrastructure
+                        instead of Clusters page on the ACM console, useful with ACM 2.14 and higher use cases
+
         """
-        log.info("Navigate into Clusters Page")
-        self.check_element_presence(
+        self.page_has_loaded(retries=12, sleep_time=5)
+        log.info("Now on Infrastructure page")
+        assert self.check_element_presence(
             (
                 self.acm_page_nav["Infrastructure"][1],
                 self.acm_page_nav["Infrastructure"][0],
             ),
             timeout=timeout,
         )
-        self.choose_expanded_mode(
-            mode=True, locator=self.acm_page_nav["Infrastructure"]
+
+        infra_button = WebDriverWait(self.driver, 30).until(
+            EC.element_to_be_clickable(
+                (
+                    self.acm_page_nav["Infrastructure"][1],
+                    self.acm_page_nav["Infrastructure"][0],
+                )
+            )
         )
-        self.do_click(
-            locator=self.acm_page_nav["Clusters_page"],
-            timeout=timeout,
-            enable_screenshot=True,
-            avoid_stale=True,
+        self.driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});", infra_button
         )
+        log.info(
+            "Checking if options under Infrastructure page are expanded or collapsed "
+        )
+
+        if infra_button.get_attribute("aria-expanded") != "true":
+            self.driver.execute_script("arguments[0].click();", infra_button)
+            log.info(
+                "Successfully expanded Infrastructure sidecar to enable all dropdown options"
+            )
+        self.take_screenshot()
+        if vms:
+            log.info("Navigate into Virtual machines Page instead")
+            self.do_click(
+                locator=self.acm_page_nav["vms_page"],
+                timeout=timeout,
+                enable_screenshot=True,
+                avoid_stale=True,
+            )
+        else:
+            log.info("Navigate into Clusters Page")
+            self.do_click(
+                locator=self.acm_page_nav["Clusters_page"],
+                timeout=timeout,
+                enable_screenshot=True,
+                avoid_stale=True,
+            )
 
     def navigate_bare_metal_assets_page(self):
         """
@@ -203,20 +241,43 @@ class AcmPageNavigator(BaseUI):
 
         """
 
-        if not self.check_element_presence(
-            (
-                self.acm_page_nav["click-local-cluster"][1],
-                self.acm_page_nav["click-local-cluster"][0],
-            ),
-            timeout=300,
-        ):
-            log.error("local-cluster is not found, can not switch to ACM console")
-            self.take_screenshot()
-            raise NoSuchElementException
-        log.info("Click on local-cluster")
-        self.do_click(self.acm_page_nav["click-local-cluster"])
-        log.info("Select All Clusters view")
-        self.do_click(self.acm_page_nav["all-clusters-view"])
+        try:
+            if not self.check_element_presence(
+                (
+                    self.acm_page_nav["click-local-cluster"][1],
+                    self.acm_page_nav["click-local-cluster"][0],
+                ),
+                timeout=15,
+            ):
+                log.warning("local-cluster is not found while switching to ACM console")
+                self.take_screenshot()
+            else:
+                log.info("Click on local-cluster")
+                self.do_click(self.acm_page_nav["click-local-cluster"])
+                log.info("Select All Clusters view")
+                self.do_click(self.acm_page_nav["all-clusters-view"])
+                self.take_screenshot()
+        except (NoSuchElementException, TimeoutException) as e:
+            log.exception(
+                f"Exception occurred: {e} while switching to 'All Clusters' view"
+            )
+            if not self.check_element_presence(
+                (
+                    self.acm_page_nav["click-admin-dropdown"][1],
+                    self.acm_page_nav["click-admin-dropdown"][0],
+                ),
+                timeout=15,
+            ):
+                log.error(
+                    "Administrator dropdown is not found, can not switch to ACM console"
+                )
+                self.take_screenshot()
+                raise NoSuchElementException
+            else:
+                log.info("Click on Administrator dropdown")
+                self.do_click(self.acm_page_nav["click-admin-dropdown"])
+                log.info("Select Fleet Management view")
+                self.do_click(self.acm_page_nav["fleet-management-view"])
         # There is a modal dialog box which appears as soon as we login
         # we need to click on close on that dialog box
         if self.check_element_presence(
@@ -224,9 +285,9 @@ class AcmPageNavigator(BaseUI):
                 self.acm_page_nav["modal_dialog_close_button"][1],
                 self.acm_page_nav["modal_dialog_close_button"][0],
             ),
-            timeout=200,
+            timeout=15,
         ):
-            self.do_click(self.acm_page_nav["modal_dialog_close_button"], timeout=300)
+            self.do_click(self.acm_page_nav["modal_dialog_close_button"], timeout=15)
         log.info("Successfully navigated to ACM console")
         self.take_screenshot()
 

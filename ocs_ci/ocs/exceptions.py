@@ -766,3 +766,11 @@ class DistributionStatusError(Exception):
 
 class InvalidPodPresent(Exception):
     pass
+
+
+class FloatingIPAssignException(Exception):
+    pass
+
+
+class SubctlDownloadFailed(Exception):
+    pass

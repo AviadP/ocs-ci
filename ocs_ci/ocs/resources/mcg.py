@@ -40,6 +40,7 @@ from ocs_ci.utility.utils import (
     exec_cmd,
     TimeoutSampler,
     mask_secrets,
+    get_noobaa_cli_config,
 )
 from ocs_ci.helpers.helpers import retrieve_cli_binary, flatten_multilevel_dict
 from ocs_ci.helpers.helpers import (
@@ -94,16 +95,29 @@ class MCG:
                 resource=self.operator_pod, state=constants.STATUS_RUNNING, timeout=300
             )
 
+            # Determine which CLI to use based on version
+            self.cli_path, self.command_prefix = get_noobaa_cli_config()
+            ocs_version = version.get_semantic_ocs_version_from_config()
+
+            # Initialize ODFCliRunner for OCS >= 4.20
+            self.odf_cli_runner = None
+            if ocs_version >= version.VERSION_4_20:
+                from ocs_ci.helpers.odf_cli import ODFCliRunner
+
+                self.odf_cli_runner = ODFCliRunner()
+
             if (
-                not os.path.isfile(constants.NOOBAA_OPERATOR_LOCAL_CLI_PATH)
-                or self.get_mcg_cli_version().minor
-                != version.get_semantic_ocs_version_from_config().minor
+                not os.path.isfile(self.cli_path)
+                or self.get_mcg_cli_version().minor != ocs_version.minor
             ):
                 logger.info(
-                    "The expected MCG CLI binary could not be found,"
+                    "The expected NooBaa CLI binary could not be found,"
                     " downloading the expected version"
                 )
-                retrieve_cli_binary(cli_type="mcg")
+                if ocs_version >= version.VERSION_4_20:
+                    retrieve_cli_binary(cli_type="odf")
+                else:
+                    retrieve_cli_binary(cli_type="mcg")
 
             """
             The certificate will be copied on each mcg_obj instantiation since
@@ -121,13 +135,7 @@ class MCG:
                 .get("serviceS3")
                 .get("externalDNS")[0]
             )
-            self.s3_internal_endpoint = (
-                get_noobaa.get("items")[0]
-                .get("status")
-                .get("services")
-                .get("serviceS3")
-                .get("internalDNS")[0]
-            )
+            self.s3_internal_endpoint = self.determine_s3_endpoint()
             self.sts_endpoint = (
                 get_noobaa.get("items")[0]
                 .get("status")
@@ -213,6 +221,30 @@ class MCG:
             )
             assert False, (
                 "NB RPC token was not retrieved successfully " "within the time limit."
+            )
+
+    def determine_s3_endpoint(self):
+        """
+        Get external mcg S3 endpoint if the cluster is in multicluster environment.
+        Get internal endpoint otherwise.
+
+        Returns:
+            string: S3 endpoint URI
+
+        """
+        if config.multicluster:
+            logger.warning(
+                "Multicluster test run is executed. External S3 enpoint is used instead of internal."
+            )
+            return self.s3_endpoint
+        else:
+            get_noobaa = OCP(kind="noobaa", namespace=self.namespace).get()
+            return (
+                get_noobaa.get("items")[0]
+                .get("status")
+                .get("services")
+                .get("serviceS3")
+                .get("internalDNS")[0]
             )
 
     def s3_get_all_bucket_names(self):
@@ -497,7 +529,9 @@ class MCG:
         if platform == constants.AWS_PLATFORM:
             params = {
                 "auth_method": "AWS_V4",
-                "endpoint": constants.MCG_NS_AWS_ENDPOINT,
+                "endpoint": constants.MCG_NS_AWS_ENDPOINT.format(
+                    constants.DEFAULT_AWS_REGION
+                ),
                 "endpoint_type": "AWS",
                 "identity": get_attr_chain(cld_mgr, "aws_client.access_key"),
                 "name": conn_name,
@@ -918,28 +952,65 @@ class MCG:
                 f"The BackingStore did not reach the desired state "
                 f"{desired_state} within the time limit."
             )
-            assert False
+            raise
 
     def exec_mcg_cmd(
         self, cmd, namespace=None, use_yes=False, ignore_error=False, **kwargs
     ):
         """
-        Executes an MCG CLI command through the noobaa-operator pod's CLI binary
+        Executes a NooBaa CLI command through the appropriate CLI binary
+
+        For OCS >= 4.20: Uses odf-cli noobaa <command> via ODFCliRunner
+        For OCS < 4.20: Uses mcg-cli <command> directly
 
         Args:
             cmd (str): The command to run
             namespace (str): The namespace to run the command in
+            use_yes (bool): If True, pipe 'yes' to the command
+            ignore_error (bool): If True, don't raise exception on non-zero exit
+            **kwargs: Additional arguments to pass to exec_cmd
 
         Returns:
-            str: stdout of the command
+            CompletedProcess: Result object with stdout and stderr as decoded strings
 
         """
+        # Use ODFCliRunner for OCS >= 4.20
+        if self.odf_cli_runner:
+            # Pass namespace without -n prefix (run_noobaa will add it)
+            ns = namespace if namespace else self.namespace
 
+            # Mask sensitive data
+            if self.data_to_mask:
+                kwargs.setdefault("secrets", []).extend(self.data_to_mask)
+
+            result = self.odf_cli_runner.run_noobaa(
+                cmd,
+                namespace=ns,
+                use_yes=use_yes,
+                ignore_error=ignore_error,
+                **kwargs,
+            )
+            # Decode stdout/stderr if they're bytes
+            if hasattr(result, "stdout") and isinstance(result.stdout, bytes):
+                result.stdout = result.stdout.decode()
+            if hasattr(result, "stderr") and isinstance(result.stderr, bytes):
+                result.stderr = result.stderr.decode()
+            return result
+
+        # Original implementation for OCS < 4.20
         kubeconfig = config.RUN.get("kubeconfig")
         if kubeconfig:
             kubeconfig = f"--kubeconfig {kubeconfig} "
 
         namespace = f"-n {namespace}" if namespace else f"-n {self.namespace}"
+
+        # Build the full command using stored CLI configuration
+        if self.command_prefix:
+            # For odf-cli: odf-cli noobaa <command>
+            full_cmd = f"{self.cli_path} {self.command_prefix} {cmd} {namespace}"
+        else:
+            # For mcg-cli: mcg-cli <command>
+            full_cmd = f"{self.cli_path} {cmd} {namespace}"
 
         # Mask sensitive data
         if self.data_to_mask:
@@ -947,14 +1018,14 @@ class MCG:
 
         if use_yes:
             result = exec_cmd(
-                [f"yes | {constants.NOOBAA_OPERATOR_LOCAL_CLI_PATH} {cmd} {namespace}"],
+                [f"yes | {full_cmd}"],
                 ignore_error=ignore_error,
                 shell=True,
                 **kwargs,
             )
         else:
             result = exec_cmd(
-                f"{constants.NOOBAA_OPERATOR_LOCAL_CLI_PATH} {cmd} {namespace}",
+                full_cmd,
                 ignore_error=ignore_error,
                 **kwargs,
             )
@@ -1021,7 +1092,14 @@ class MCG:
             timeout=timeout,
             sleep=10,
         )
-        timeout = int(timeout - (time.time() - starttime))
+
+        # The timeout is reduced by the time already spent waiting for the pods
+        # time spent might get longer than the timeout due to overheads,
+        # so we set a minimum timeout of 60 seconds
+        time_spent = time.time() - starttime
+        time_remaining = timeout - time_spent
+        timeout = max(int(time_remaining), 60)
+
         try:
             for mcg_status_ready in TimeoutSampler(
                 timeout=timeout, sleep=30, func=MCG._status
@@ -1035,30 +1113,45 @@ class MCG:
 
     def get_mcg_cli_version(self):
         """
-        Get the MCG CLI version by parsing the output of the `mcg-cli version` command.
+        Get the NooBaa CLI version by parsing the output of the version command.
 
         Example output of the mcg-cli version command:
-
             INFO[0000] CLI version: 5.12.0
             INFO[0000] noobaa-image: noobaa/noobaa-core:master-20220913
             INFO[0000] operator-image: noobaa/noobaa-operator:5.12.0
+
+        Example output of the odf-cli noobaa version command:
+            CLI version: 5.20.0
+            noobaa-image: noobaa/noobaa-core:master-20240101
+            operator-image: noobaa/noobaa-operator:5.20.0
 
         Returns:
             semantic_version.base.Version: Object of semantic version.
 
         """
 
-        # mcg-cli sends the output to stderr in this case
-        cmd_output = self.exec_mcg_cmd("version").stderr
+        # Execute version command using appropriate CLI
+        cmd_result = self.exec_mcg_cmd("version")
+
+        # Try stderr first (mcg-cli sends output to stderr)
+        # Then try stdout (odf-cli might send to stdout)
+        cmd_output = (
+            cmd_result.stderr if cmd_result.stderr.strip() else cmd_result.stdout
+        )
 
         # \s* captures any number of spaces
         # \S+ captures any number of non-space characters
         regular_expression = r"CLI version:\s*(\S+)"
 
         # group(1) is the first capturing group, which is the version string
-        mcg_cli_version_str = re.search(
-            regular_expression, cmd_output, re.IGNORECASE
-        ).group(1)
+        match = re.search(regular_expression, cmd_output, re.IGNORECASE)
+
+        if not match:
+            logger.warning(f"Could not parse CLI version from output: {cmd_output}")
+            # Fallback to current OCS version if parsing fails
+            return version.get_semantic_ocs_version_from_config()
+
+        mcg_cli_version_str = match.group(1)
 
         return version.get_semantic_version(mcg_cli_version_str, only_major_minor=True)
 

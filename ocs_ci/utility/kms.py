@@ -1909,7 +1909,7 @@ class KMIP(KMS):
         secret_name = run_cmd(cmd=cmd)
 
         cmd = (
-            rf"oc get secret {secret_name} -o jsonpath=\"{{.data[\'UniqueIdentifier\']}}\""
+            rf"oc get secret {secret_name} -o jsonpath=\"{{.data[\'UniqueIdentifierNew\']}}\""
             f" -n {config.ENV_DATA['cluster_namespace']}"
         )
         noobaa_key_id = base64.b64decode(run_cmd(cmd=cmd)).decode()
@@ -1922,7 +1922,7 @@ class KMIP(KMS):
         """
         self.validate_ciphertrust_deployment()
 
-    @retry(NotFoundError, tries=2, delay=30)
+    @retry(NotFoundError, tries=10, delay=30)
     def validate_ciphertrust_deployment(self):
         """
         Verify whether OSD and NooBaa keys are stored in CipherTrust Manager
@@ -1952,7 +1952,7 @@ class KMIP(KMS):
             logger.info("KMIP: Noobaa encryption key found in CipherTrust Manager")
         else:
             raise NotFoundError(
-                "KMIP: Noobaa encryption key found in CipherTrust Manager"
+                "KMIP: Noobaa encryption key not found in CipherTrust Manager"
             )
 
         # Check kms enabled

@@ -6,13 +6,13 @@ import logging
 import tempfile
 import json
 
-from ocs_ci.deployment.qe_app_registry import QeAppRegistry
 from ocs_ci.ocs import ocp
 from ocs_ci.ocs.ocp import OCP
 from ocs_ci.ocs.resources.ocs import OCS
 from ocs_ci.framework import config
 from ocs_ci.utility import templating
 from ocs_ci.ocs import constants
+from ocs_ci.utility.multicluster import create_mce_catsrc
 from ocs_ci.utility.utils import (
     run_cmd,
     exec_cmd,
@@ -146,6 +146,13 @@ class MCEInstaller(object):
                 mce_subscription_yaml_data["spec"]["channel"] = config.DEPLOYMENT.get(
                     "mce_channel"
                 )
+            else:
+                mce_subscription_yaml_data["spec"][
+                    "channel"
+                ] = f"stable-{config.ENV_DATA.get('mce_version')}"
+            mce_subscription_yaml_data["spec"][
+                "source"
+            ] = constants.MCE_DEV_CATALOG_SOURCE_NAME
 
             mce_subscription_manifest = tempfile.NamedTemporaryFile(
                 mode="w+", prefix="mce_subscription_manifest", delete=False
@@ -188,9 +195,11 @@ class MCEInstaller(object):
             namespace=constants.HYPERSHIFT_NAMESPACE,
         )
 
+        # configMap is created during hypershift installation in around 5 min.
+        # Increasing this timeout to 10 min for safer deployment.
         if not configmaps_obj.check_resource_existence(
             should_exist=True,
-            timeout=300,
+            timeout=600,
             resource_name=constants.SUPPORTED_VERSIONS_CONFIGMAP,
         ):
             raise UnavailableResourceException(
@@ -254,9 +263,7 @@ class MCEInstaller(object):
         if not self.mce_installed():
             logger.info("Installing mce")
             # we create catsrc with nightly builds only if config.DEPLOYMENT does not have mce_latest_stable
-            qe_app_registry = QeAppRegistry()
-            qe_app_registry.icsp()
-            qe_app_registry.catalog_source()
+            create_mce_catsrc()
             self.create_mce_namespace()
             self.create_multiclusterengine_operatorgroup()
             self.create_mce_subscription()
@@ -284,6 +291,18 @@ class MCEInstaller(object):
         self.check_supported_versions()
 
         self.wait_mce_resources()
+
+        # avoid circular dependency with hosted cluster
+        from ocs_ci.deployment.hosted_cluster import (
+            apply_hosted_cluster_mirrors_max_items_wa,
+            apply_hosted_control_plane_mirrors_max_items_wa,
+        )
+
+        logger.info("Correct max items in hostedclsuters crd")
+        apply_hosted_cluster_mirrors_max_items_wa()
+
+        logger.info("Correct max items in hostedcontrolplane crd")
+        apply_hosted_control_plane_mirrors_max_items_wa()
 
     def mce_installed(self):
         """

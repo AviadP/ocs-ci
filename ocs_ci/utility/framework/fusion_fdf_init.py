@@ -14,7 +14,7 @@ from ocs_ci.framework.exceptions import (
 )
 from ocs_ci.ocs import constants
 from ocs_ci.ocs.exceptions import CommandFailed
-from ocs_ci.utility import utils
+from ocs_ci.utility import reporting, utils
 from ocs_ci.utility.framework.initialization import load_config
 from ocs_ci.framework import config
 from ocs_ci.utility.utils import (
@@ -83,6 +83,8 @@ class Initializer(object):
             except FileNotFoundError:
                 raise ClusterNameNotProvidedError()
 
+        config.REPORTING["report_path"] = args.report
+
     def init_cli(self, args: list) -> list:
         """
         Initialize the CLI and parse provided arguments.
@@ -104,6 +106,9 @@ class Initializer(object):
             default=[],
             help="Path to config file. Repeatable.",
         )
+        parser.add_argument(
+            "--report", default=None, help="Filepath for generated junit report"
+        )
         parsed_args, _ = parser.parse_known_args(args)
 
         return parsed_args
@@ -112,17 +117,18 @@ class Initializer(object):
         """
         Initialize the logging config.
         """
-        log_dir = config.RUN["log_dir"]
+        base_log_dir = os.path.expanduser(config.RUN.get("log_dir"))
         log_level = config.RUN.get("log_level", "INFO")
-        log_name = f"{self.log_basename}_{self.run_id}"
+        sub_log_dir_name = f"{self.log_basename}-{self.run_id}"
+        sub_log_dir = os.path.join(base_log_dir, sub_log_dir_name)
         log_formatter = logging.Formatter(constants.LOG_FORMAT)
         root_logger = logging.getLogger()
         root_logger.setLevel(log_level)
 
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir)
+        if not os.path.exists(sub_log_dir):
+            os.makedirs(sub_log_dir)
 
-        log_file = os.path.join(log_dir, f"{log_name}.log")
+        log_file = os.path.join(sub_log_dir, "logs")
 
         file_handler = logging.FileHandler(log_file)
         file_handler.setFormatter(log_formatter)
@@ -156,19 +162,29 @@ class Initializer(object):
             dict: TestSuite properties
 
         """
+        # General properties
         props = {}
         props["run_id"] = config.RUN.get("run_id")
-        props["cluster_path"] = config.ENV_DATA.get("cluster_path")
-        props["logs_dir"] = config.RUN.get("log_dir")
+        props["cluster_path"] = config.RUN.get("cluster_dir_full_path")
+        props["logs_url"] = config.RUN.get("logs_url")
         props["ocp_version"] = get_running_ocp_version(
             kubeconfig=config.RUN["kubeconfig"]
         )
 
+        # ReportPortal properties
+        props["rp_launch_description"] = reporting.get_rp_launch_description()
+        props["rp_launch_url"] = config.REPORTING.get("rp_launch_url")
+        attributes = reporting.get_rp_launch_attributes()
+        for key, value in attributes.items():
+            props[f"rp_{key}"] = value
+
+        # Fusion Pre-Release properties
         if config.DEPLOYMENT.get("fusion_pre_release"):
             props["fusion_pre_release_image"] = config.DEPLOYMENT.get(
                 "fusion_pre_release_image"
             )
 
+        # FDF Pre-release properties
         if self.deployment_type == "fdf":
             if config.DEPLOYMENT.get("fdf_pre_release"):
                 props["fdf_image_tag"] = config.DEPLOYMENT.get("fdf_image_tag")
@@ -276,6 +292,7 @@ def create_junit_report(
             try:
                 func(*args, **kwargs)
             except Exception as e:
+                logger.exception(e)
                 test_case.result = [Failure(e)]
 
             add_post_deployment_props(test_suite)
@@ -284,9 +301,12 @@ def create_junit_report(
             xml = JUnitXml()
             xml.add_testsuite(test_suite)
 
-            log_dir = config.RUN["log_dir"]
-            run_id = config.RUN["run_id"]
-            filepath = os.path.join(log_dir, f"{case_name}_{run_id}.xml")
+            if config.REPORTING.get("report_path"):
+                filepath = config.REPORTING.get("report_path")
+            else:
+                log_dir = os.path.expanduser(config.RUN["log_dir"])
+                run_id = config.RUN["run_id"]
+                filepath = os.path.join(log_dir, f"{case_name}_{run_id}.xml")
 
             logger.info(f"Writing report to {filepath}")
             xml.write(filepath, pretty=True)
@@ -319,6 +339,9 @@ def add_post_deployment_props(test_suite: TestSuite):
         value = config.DEPLOYMENT.get(key)
         if value:
             test_suite.add_property(key, value)
+
+    # ReportPortal
+    test_suite.add_property("rp_launch_name", reporting.get_rp_launch_name())
 
 
 class TestCaseWithProps(TestCase):

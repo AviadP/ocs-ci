@@ -44,7 +44,6 @@ from ocs_ci.ocs.resources.pod import (
     get_mds_pods,
     get_mgr_pods,
     get_rgw_pods,
-    get_plugin_pods,
     get_cephfsplugin_provisioner_pods,
     get_rbdfsplugin_provisioner_pods,
     get_ceph_tools_pod,
@@ -181,6 +180,7 @@ def ocs_install_verification(
     from ocs_ci.ocs.resources.pod import get_ceph_tools_pod, get_all_pods
     from ocs_ci.ocs.cluster import validate_cluster_on_pvc
     from ocs_ci.ocs.resources.fips import check_fips_enabled
+    from ocs_ci.ocs.resources.storageconsumer import verify_storage_consumer_resources
 
     number_of_worker_nodes = len(get_nodes())
     namespace = config.ENV_DATA["cluster_namespace"]
@@ -777,7 +777,7 @@ def ocs_install_verification(
                 namespace,
                 health_check_tries,
                 health_check_delay,
-                fix_ceph_health=rdr_run,
+                fix_ceph_health=True,
             )
         except CephHealthRecoveredException as ex:
             if rdr_run and "slow ops" in str(ex):
@@ -938,11 +938,19 @@ def ocs_install_verification(
     log.info("Verified the ownerReferences CSI plugin daemonsets")
     log.info("Verifying the providerAPIServerServiceType setting in StorageCluster")
     sc_obj = get_storage_cluster()
-    if sc_obj.get().get("items")[0].get("spec").get("hostNetwork"):
+    sc_ob_spec = sc_obj.get().get("items")[0].get("spec")
+    if sc_ob_spec.get("hostNetwork") is True:
         assert (
-            sc_obj.get().get("items")[0].get("spec").get("providerAPIServerServiceType")
+            sc_ob_spec.get("providerAPIServerServiceType")
             == constants.SERVICE_TYPE_NODEPORT
         ), f"Provider API server service type is not {constants.SERVICE_TYPE_NODEPORT}"
+        # check the rule in bz DFBUGS-2324 is followed:
+        assert (
+            sc_ob_spec.get("managedResources", {})
+            .get("cephObjectStores", {})
+            .get("hostNetwork", True)
+            is False
+        ), "Host network is not set to False for cephObjectStores when spec.hostNetwork is True"
     log.info("Verified the providerAPIServerServiceType setting in StorageCluster")
     log.info("Verifying the csi driver ownership")
     csi_driver_list = [constants.RBD_PROVISIONER, constants.CEPHFS_PROVISIONER]
@@ -961,6 +969,19 @@ def ocs_install_verification(
                 owner_references[0].get("name") == constants.CLIENT_OPERATOR_CONFIGMAP
             ), f"Owner reference of {driver} driver is not {constants.CLIENT_OPERATOR_CONFIGMAP}"
     log.info("Verified the ownerReferences for CSI drivers")
+
+    no_ceph = (
+        config.DEPLOYMENT["external_mode"] or config.ENV_DATA["mcg_only_deployment"]
+    )
+
+    if not no_ceph:
+        log.info(
+            f"Verifying '{constants.INTERNAL_STORAGE_CONSUMER_NAME}' storage consumer resources"
+        )
+        verify_storage_consumer_resources(constants.INTERNAL_STORAGE_CONSUMER_NAME)
+        log.info(
+            f"Verified '{constants.INTERNAL_STORAGE_CONSUMER_NAME}' storage consumer resources"
+        )
 
 
 def mcg_only_install_verification(ocs_registry_image=None):
@@ -1902,7 +1923,8 @@ def set_deviceset_count(count):
 
 def get_storage_cluster(namespace=None):
     """
-    Get storage cluster name
+    Get storage cluster object
+    (from provider cluster if run on multicluster environment)
 
     Args:
         namespace (str): Namespace of the resource
@@ -1911,9 +1933,10 @@ def get_storage_cluster(namespace=None):
         storage cluster (obj) : Storage cluster object handler
 
     """
-    if namespace is None:
-        namespace = config.ENV_DATA["cluster_namespace"]
-    sc_obj = OCP(kind=constants.STORAGECLUSTER, namespace=namespace)
+    with config.RunWithProviderConfigContextIfAvailable():
+        if namespace is None:
+            namespace = config.ENV_DATA["cluster_namespace"]
+        sc_obj = OCP(kind=constants.STORAGECLUSTER, namespace=namespace)
     return sc_obj
 
 
@@ -2146,24 +2169,28 @@ def verify_multus_network():
 
         log.info("Verifying multus public network exists on CSI pods")
         csi_pods = []
-        interfaces = [constants.CEPHBLOCKPOOL, constants.CEPHFILESYSTEM]
-        for interface in interfaces:
-            plugin_pods = get_plugin_pods(interface)
-            csi_pods += plugin_pods
-
+        # Nodeplugin pods were deleted from validation based on input from BZ: DFBUGS-2794
         cephfs_provisioner_pods = get_cephfsplugin_provisioner_pods()
         rbd_provisioner_pods = get_rbdfsplugin_provisioner_pods()
 
         csi_pods += cephfs_provisioner_pods
         csi_pods += rbd_provisioner_pods
-
+        pod_validation_failures = {}
         for _pod in csi_pods:
-            pod_networks = _pod.data["metadata"]["annotations"][
-                "k8s.v1.cni.cncf.io/networks"
-            ]
-            assert verify_networks_in_ceph_pod(
-                pod_networks, public_net_name, public_net_namespace
-            ), f"{public_net_name} not in {pod_networks}"
+            pod_name = _pod.data["metadata"]["name"]
+            try:
+                pod_networks = _pod.data["metadata"]["annotations"][
+                    "k8s.v1.cni.cncf.io/networks"
+                ]
+                assert verify_networks_in_ceph_pod(
+                    pod_networks, public_net_name, public_net_namespace
+                ), f"{public_net_name} not in {pod_networks}"
+            except (KeyError, AssertionError, CommandFailed) as ex:
+                pod_validation_failures[pod_name] = ex
+        # In this case we will be able to see all the pods which have an issue
+        assert (
+            not pod_validation_failures
+        ), f"There were several failues in multus annotation validations: {pod_validation_failures}"
 
         log.info("Verifying MDS Map IPs are in the multus public network range")
         ceph_fs_dump_data = get_ceph_tools_pod().exec_ceph_cmd(
@@ -3046,14 +3073,14 @@ def get_client_storage_provider_endpoint():
 
 def wait_for_storage_client_connected(timeout=180, sleep=10):
     """
-    Wait for the storage-client to be in a connected phase
+    Wait for the Storage client to be in a connected phase
 
     Args:
-        timeout (int): Time to wait for the storage-client to be in a connected phase
+        timeout (int): Time to wait for the Storage Client to be in a connected phase
         sleep (int): Time in seconds to sleep between attempts
 
     Raises:
-        ResourceWrongStatusException: In case the storage-client didn't reach the desired connected phase
+        ResourceWrongStatusException: In case the Storage Client didn't reach the desired connected phase
 
     """
     sc_obj = OCP(
@@ -3328,12 +3355,7 @@ def check_unnecessary_pods_present():
     log.info(f"Checking if only required operator pods are available in : {pod_names}")
     invalid_pods_found = []
     if no_noobaa:
-        for invalid_pod_name in [
-            constants.NOOBAA_OPERATOR_DEPLOYMENT,
-            constants.NOOBAA_ENDPOINT_DEPLOYMENT,
-            constants.NOOBAA_DB_STATEFULSET,
-            constants.NOOBAA_CORE_STATEFULSET,
-        ]:
+        for invalid_pod_name in constants.NOOBAA_POD_NAMES:
             invalid_pods_found.extend(
                 [
                     pod_name
@@ -3346,7 +3368,7 @@ def check_unnecessary_pods_present():
                 f"Pods {invalid_pods_found} should not be present because NooBaa is not available"
             )
     if no_ceph:
-        for invalid_pod_name in [constants.ROOK_CEPH_OPERATOR]:
+        for invalid_pod_name in constants.CEPH_PODS_NAMES:
             invalid_pods_found.extend(
                 [
                     pod_name

@@ -85,7 +85,14 @@ from ocs_ci.ocs.monitoring import (
     validate_pvc_created_and_bound_on_monitoring_pods,
     validate_pvc_are_mounted_on_monitoring_pods,
 )
-from ocs_ci.ocs.node import get_worker_nodes, verify_all_nodes_created
+from ocs_ci.ocs.node import (
+    get_worker_nodes,
+    verify_all_nodes_created,
+    label_nodes,
+    get_all_nodes,
+    get_node_objs,
+    get_nodes,
+)
 from ocs_ci.ocs.ocp import OCP
 from ocs_ci.ocs.resources import machineconfig
 from ocs_ci.ocs.resources import packagemanifest
@@ -136,7 +143,7 @@ from ocs_ci.ocs.utils import (
 )
 from ocs_ci.utility.deployment import (
     create_external_secret,
-    get_and_apply_icsp_from_catalog,
+    get_and_apply_idms_from_catalog,
     workaround_mark_disks_as_ssd,
 )
 from ocs_ci.utility.flexy import load_cluster_info
@@ -148,6 +155,7 @@ from ocs_ci.utility import (
     version,
 )
 from ocs_ci.utility.aws import update_config_from_s3, create_and_attach_sts_role
+from ocs_ci.utility.multicluster import create_mce_catsrc
 from ocs_ci.utility.retry import retry
 from ocs_ci.utility.secret import link_all_sa_and_secret_and_delete_pods
 from ocs_ci.utility.ssl_certs import (
@@ -158,6 +166,7 @@ from ocs_ci.utility.ssl_certs import (
 from ocs_ci.utility.utils import (
     ceph_health_check,
     clone_repo,
+    create_unreleased_oadp_catalog,
     enable_huge_pages,
     exec_cmd,
     get_latest_ds_olm_tag,
@@ -357,11 +366,6 @@ class Deployment(object):
         Deploy OCS/ODF and run verification as well
 
         """
-        if config.ENV_DATA.get("odf_provider_mode_deployment", False):
-            logger.warning(
-                "Skipping normal ODF deployment because ODF deployment in Provider mode will be performed"
-            )
-            return
         try:
             if not config.ENV_DATA["skip_ocs_deployment"]:
                 for i in range(config.nclusters):
@@ -471,50 +475,109 @@ class Deployment(object):
         """
         if config.ENV_DATA.get("skip_dr_deployment", False):
             return
+
+        def version_exist(pm, required_version):
+            """
+            Check if the given PackageManifest includes the specified OADP version.
+
+            Args:
+                pm (dict): The PackageManifest data as a dictionary.
+                required_version (str): The OADP version to look for (e.g., "1.5").
+
+            Returns:
+                bool: True if the version exists in any channel's entries, False otherwise.
+
+            """
+            for channel in pm.get("status", {}).get("channels", []):
+                for entry in channel.get("entries", []):
+                    entry_version = entry.get("version")
+                    if entry_version and version.get_semantic_version(
+                        entry_version, only_major_minor=True
+                    ) == version.get_semantic_version(
+                        required_version, only_major_minor=True
+                    ):
+                        return True
+            return False
+
         if config.multicluster:
-            managed_clusters = get_non_acm_cluster_config()
-            for cluster in managed_clusters:
+            for cluster in config.clusters:
                 index = cluster.MULTICLUSTER["multicluster_index"]
-                config.switch_ctx(index)
-                logger.info("Creating Namespace")
-                # creating Namespace and operator group for cert-manager
-                logger.info("Creating namespace and operator group for Openshift-oadp")
-                run_cmd(f"oc create -f {constants.OADP_NS_YAML}")
-                logger.info("Creating OADP Operator Subscription")
-                oadp_subscription_yaml_data = templating.load_yaml(
-                    constants.OADP_SUBSCRIPTION_YAML
-                )
-                package_manifest = PackageManifest(
-                    resource_name=constants.OADP_OPERATOR_NAME,
-                    selector="catalog=redhat-operators",
-                )
-                oadp_default_channel = package_manifest.get_default_channel()
-                oadp_subscription_yaml_data["spec"]["channel"] = oadp_default_channel
-                oadp_subscription_manifest = tempfile.NamedTemporaryFile(
-                    mode="w+", prefix="oadp_subscription_manifest", delete=False
-                )
-                templating.dump_data_to_temp_yaml(
-                    oadp_subscription_yaml_data, oadp_subscription_manifest.name
-                )
-                run_cmd(f"oc create -f {oadp_subscription_manifest.name}")
-                self.wait_for_subscription(
-                    constants.OADP_OPERATOR_NAME, namespace=constants.OADP_NAMESPACE
-                )
-                logger.info(
-                    "Sleeping for 120 seconds after subscribing to OADP Operator"
-                )
-                time.sleep(120)
-                oadp_subscriptions = ocp.OCP(
-                    kind=constants.SUBSCRIPTION_WITH_ACM,
-                    resource_name=constants.OADP_OPERATOR_NAME,
-                    namespace=constants.OADP_NAMESPACE,
-                ).get()
-                oadp_csv_name = oadp_subscriptions["status"]["currentCSV"]
-                csv = CSV(
-                    resource_name=oadp_csv_name, namespace=constants.OADP_NAMESPACE
-                )
-                csv.wait_for_phase("Succeeded", timeout=720)
-                logger.info("OADP Operator Deployment Succeeded")
+                with config.RunWithConfigContext(index):
+                    config.switch_ctx(index)
+                    logger.info("Creating Namespace")
+                    # creating Namespace and operator group for cert-manager
+                    logger.info(
+                        "Creating namespace and operator group for Openshift-oadp"
+                    )
+                    run_cmd(f"oc create -f {constants.OADP_NS_YAML}")
+                    logger.info("Creating OADP Operator Subscription")
+                    oadp_subscription_yaml_data = templating.load_yaml(
+                        constants.OADP_SUBSCRIPTION_YAML
+                    )
+                    package_manifest = PackageManifest(
+                        resource_name=constants.OADP_OPERATOR_NAME,
+                        selector="catalog=redhat-operators",
+                    )
+                    try:
+                        pm_data = package_manifest.get()
+                        pm_list = pm_data if isinstance(pm_data, list) else [pm_data]
+                        required_oadp_version = config.ENV_DATA["oadp_version"]
+
+                        if not any(
+                            version_exist(pm, required_oadp_version)
+                            and pm.get("status", {}).get("catalogSource")
+                            == constants.OPERATOR_CATALOG_SOURCE_NAME
+                            for pm in pm_list
+                        ):
+                            raise ResourceNotFoundError(
+                                f"Didn't find OADP {required_oadp_version}"
+                            )
+
+                    except ResourceNotFoundError as ex:
+                        logger.warning(
+                            f"OADP operator not availabe - bringing up unreleased content {ex}!"
+                        )
+                        create_unreleased_oadp_catalog()
+                        package_manifest = PackageManifest(
+                            resource_name=constants.OADP_OPERATOR_NAME,
+                            selector=f"catalog={constants.OADP_CATALOG_NAME}",
+                        )
+                        oadp_subscription_yaml_data["spec"][
+                            "source"
+                        ] = constants.OADP_CATALOG_NAME
+                    oadp_default_channel = package_manifest.get_default_channel()
+                    if config.MULTICLUSTER["acm_cluster"]:
+                        logger.info("Skipping oadp subscription for ACM hub")
+                        continue
+
+                    oadp_subscription_yaml_data["spec"][
+                        "channel"
+                    ] = oadp_default_channel
+                    oadp_subscription_manifest = tempfile.NamedTemporaryFile(
+                        mode="w+", prefix="oadp_subscription_manifest", delete=False
+                    )
+                    templating.dump_data_to_temp_yaml(
+                        oadp_subscription_yaml_data, oadp_subscription_manifest.name
+                    )
+                    run_cmd(f"oc create -f {oadp_subscription_manifest.name}")
+                    self.wait_for_subscription(
+                        constants.OADP_OPERATOR_NAME, namespace=constants.OADP_NAMESPACE
+                    )
+                    logger.info(
+                        "Sleeping for 120 seconds after subscribing to OADP Operator"
+                    )
+                    time.sleep(120)
+                    oadp_subscriptions = ocp.OCP(
+                        kind=constants.SUBSCRIPTION_WITH_ACM,
+                        resource_name=constants.OADP_OPERATOR_NAME,
+                        namespace=constants.OADP_NAMESPACE,
+                    ).get()
+                    oadp_csv_name = oadp_subscriptions["status"]["currentCSV"]
+                    csv = CSV(
+                        resource_name=oadp_csv_name, namespace=constants.OADP_NAMESPACE
+                    )
+                    csv.wait_for_phase("Succeeded", timeout=720)
+                    logger.info("OADP Operator Deployment Succeeded")
 
     def do_deploy_rdr(self):
         """
@@ -562,24 +625,6 @@ class Deployment(object):
             csv_name = package_manifest.get_current_csv()
             csv = CSV(resource_name=csv_name, namespace=cert_manager_namespace)
             csv.wait_for_phase("Succeeded", timeout=300)
-
-    def do_deploy_odf_provider_mode(self):
-        """
-        Deploy ODF in provider mode and setup native client
-        """
-        # deploy provider-client deployment
-        from ocs_ci.deployment.provider_client.storage_client_deployment import (
-            ODFAndNativeStorageClientDeploymentOnProvider,
-        )
-
-        storage_client_deployment_obj = ODFAndNativeStorageClientDeploymentOnProvider()
-
-        # Provider-client deployment if odf_provider_mode_deployment: True
-        if (
-            config.ENV_DATA.get("odf_provider_mode_deployment", False)
-            and not config.ENV_DATA["skip_ocs_deployment"]
-        ):
-            storage_client_deployment_obj.provider_and_native_client_installation()
 
     def do_deploy_cnv(self):
         """
@@ -701,13 +746,18 @@ class Deployment(object):
         if perform_lso_standalone_deployment:
             cleanup_nodes_for_lso_install()
             setup_local_storage(storageclass=constants.DEFAULT_STORAGECLASS_LSO)
+
+        if config.DEPLOYMENT.get("enable_nested_virtualization"):
+            from ocs_ci.deployment.hosted_cluster import enable_nested_virtualization
+
+            enable_nested_virtualization()
+
         self.do_deploy_lvmo()
         self.do_deploy_submariner()
         self.do_gitops_deploy()
         self.do_deploy_oadp()
         self.do_deploy_ocs()
         self.do_deploy_rdr()
-        self.do_deploy_odf_provider_mode()
         self.do_deploy_mce()
         self.do_deploy_cnv()
         self.do_deploy_hyperconverged()
@@ -762,7 +812,10 @@ class Deployment(object):
         verify_all_nodes_created()
         set_selinux_permissions()
         set_registry_to_managed_state()
-        if config.ENV_DATA.get("platform") != constants.ROSA_HCP_PLATFORM:
+        if config.ENV_DATA["deployment_type"] not in (
+            constants.MANAGED_DEPL_TYPE,
+            constants.MANAGED_CP_DEPL_TYPE,
+        ):
             add_stage_cert()
         if config.ENV_DATA.get("huge_pages"):
             enable_huge_pages()
@@ -1088,6 +1141,9 @@ class Deployment(object):
         live_deployment = config.DEPLOYMENT.get("live_deployment")
         arbiter_deployment = config.DEPLOYMENT.get("arbiter_deployment")
         local_storage = config.DEPLOYMENT.get("local_storage")
+        perform_lso_standalone_deployment = config.DEPLOYMENT.get(
+            "lso_standalone_deployment", False
+        )
         platform = config.ENV_DATA.get("platform").lower()
         aws_sts_deployment = (
             config.DEPLOYMENT.get("sts_enabled")
@@ -1107,14 +1163,41 @@ class Deployment(object):
             log_step("Create STS role and attach AmazonS3FullAccess Policy")
             role_data = create_and_attach_sts_role()
             self.sts_role_arn = role_data["Role"]["Arn"]
-
-        if not live_deployment:
+        stage_testing = config.DEPLOYMENT.get("stage_rh_osbs")
+        konflux_build = config.DEPLOYMENT.get("konflux_build")
+        upgrade = config.UPGRADE.get("upgrade", False)
+        if not live_deployment and not (stage_testing and konflux_build):
             log_step("Create catalog source and wait it to be READY")
             create_catalog_source(image)
+        if konflux_build and stage_testing:
+            log_step("Creating stage ImageDigestMirrorSet")
+            exec_cmd(f"oc apply -f {constants.STAGE_IMAGE_DIGEST_MIRROR_SET_YAML}")
+            if not upgrade:
+                log_step("Creating stage TagMirrorSet")
+                exec_cmd(f"oc apply -f {constants.STAGE_TAG_MIRROR_SET_YAML}")
+                log_step("Sleeping 60 seconds after applying tag mirror set.")
+            time.sleep(60)
+            log_step("Waiting max 30 mins for master MCP to get updated")
+            exec_cmd(
+                "oc wait --for=condition=Updated --timeout=30m mcp/master", timeout=2100
+            )
+            log_step("Waiting max 30 mins for worker MCP to get updated")
+            exec_cmd(
+                "oc wait --for=condition=Updated --timeout=30m mcp/worker", timeout=2100
+            )
 
-        if local_storage:
-            log_step("Deploy and setup Local Storage Operator")
-            setup_local_storage(storageclass=constants.DEFAULT_STORAGECLASS_LSO)
+        # with Hub/Spoke deployments LSO on IBM BareMetal is a mandatory requirement, it is installed on Dependency
+        # stage when config["DEPLOYMENT"]["lso_standalone_deployment"] is set to True
+        # hence perform_lso_standalone_deployment must be False if we want to deploy LSO with ODF operator and do not
+        # execute 2nd LSO installation
+        if local_storage and not perform_lso_standalone_deployment:
+            # we only deploy LSO if localblock storageclass is not present, otherwise we will fail with 2nd installation
+            lso_deployed = ocp.OCP(kind=constants.STORAGECLASS).is_exist(
+                resource_name=constants.DEFAULT_STORAGECLASS_LSO
+            )
+            if not lso_deployed:
+                log_step("Deploy and setup Local Storage Operator")
+                setup_local_storage(storageclass=constants.DEFAULT_STORAGECLASS_LSO)
 
         log_step("Creating namespace and operator group")
         # patch OLM YAML with the namespace
@@ -1134,7 +1217,8 @@ class Deployment(object):
             run_cmd(f"oc create -f {constants.OLM_YAML}")
         except CommandFailed as ex:
             if "AlreadyExists" in str(ex):
-                logger.info("OLM resources already exist")
+                logger.info("OLM resources already exist, calling apply to update!")
+                run_cmd(f"oc apply -f {constants.OLM_YAML}")
             else:
                 raise
 
@@ -1315,11 +1399,29 @@ class Deployment(object):
             if all(
                 key in config.DEPLOYMENT for key in ("csv_change_from", "csv_change_to")
             ):
-                modify_csv(
-                    csv=csv_name,
-                    replace_from=config.DEPLOYMENT["csv_change_from"],
-                    replace_to=config.DEPLOYMENT["csv_change_to"],
-                )
+                # In case someone uses old approach passed via string for one image only
+                # directly via config.
+                if isinstance(config.DEPLOYMENT["csv_change_from"], str):
+                    zipped_csv_changes = [
+                        (
+                            config.DEPLOYMENT["csv_change_from"],
+                            config.DEPLOYMENT["csv_change_to"],
+                        ),
+                    ]
+                else:
+                    zipped_csv_changes = zip(
+                        config.DEPLOYMENT["csv_change_from"],
+                        config.DEPLOYMENT["csv_change_to"],
+                    )
+                for csv_change_from, csv_change_to in zipped_csv_changes:
+                    csvs = CSV(namespace=self.namespace)
+                    csv_list = csvs.get()["items"]
+                    for _csv in csv_list:
+                        modify_csv(
+                            csv=_csv["metadata"]["name"],
+                            replace_from=csv_change_from,
+                            replace_to=csv_change_to,
+                        )
 
         if is_storage_system_needed():
             logger.info("Creating StorageSystem")
@@ -1382,6 +1484,13 @@ class Deployment(object):
                 config.COMPONENTS[f"disable_{component}"] = True
                 logger.warning(f"disabling: {component}")
 
+        if config.DEPLOYMENT.get("host_network"):
+            logger.info("Using host network for ODF operator")
+            cluster_data["spec"]["network"] = {"hostNetwork": True}
+
+        if config.ENV_DATA.get("odf_provider_mode_deployment", False):
+            cluster_data["spec"]["providerAPIServerServiceType"] = "NodePort"
+
         # Update cluster_data with respective component enable/disable
         for key in config.COMPONENTS.keys():
             comp_name = constants.OCS_COMPONENTS_MAP[key.split("_")[1]]
@@ -1434,11 +1543,43 @@ class Deployment(object):
             and ocs_version >= version.VERSION_4_7
             and zone_num < 3
             and not config.DEPLOYMENT.get("arbiter_deployment")
+            and not (self.platform in constants.HCI_PROVIDER_CLIENT_PLATFORMS)
         ):
             cluster_data["spec"]["flexibleScaling"] = True
             # https://bugzilla.redhat.com/show_bug.cgi?id=1921023
             cluster_data["spec"]["storageDeviceSets"][0]["count"] = 3
             cluster_data["spec"]["storageDeviceSets"][0]["replica"] = 1
+        elif self.platform in constants.HCI_PROVIDER_CLIENT_PLATFORMS:
+            from ocs_ci.deployment.baremetal import disks_available_to_cleanup
+
+            nodes_obj = OCP(
+                kind=constants.NODE,
+                selector=f"{constants.OPERATOR_NODE_LABEL}",
+            )
+            nodes_data = nodes_obj.get()["items"]
+            node_names = [nodes["metadata"]["name"] for nodes in nodes_data]
+
+            no_of_worker_nodes = len(node_names)
+            number_of_disks_available_total = 0
+            # count number of disks available on all labeled nodes and divide to number of nodes
+            for node in node_names:
+                node_obj_list = get_node_objs([node])
+                number_of_disks_available_total += len(
+                    disks_available_to_cleanup(node_obj_list.pop())
+                )
+
+            number_of_disks_available = int(
+                number_of_disks_available_total / no_of_worker_nodes
+            )
+
+            # with this approach of datermining the number of nodes we assume worker nodes number of disks is equal
+            # to master nodes number of disks, in case when config.ENV_DATA.get("mark_masters_schedulable") == True,
+            # and we labeled master nodes to serve as a storage nodes
+            cluster_data["spec"]["storageDeviceSets"][0][
+                "count"
+            ] = number_of_disks_available
+            cluster_data["spec"]["storageDeviceSets"][0]["replica"] = no_of_worker_nodes
+            cluster_data["spec"]["flexibleScaling"] = True
 
         # set size of request for storage
         if self.platform.lower() in [
@@ -1548,6 +1689,11 @@ class Deployment(object):
         if config.DEPLOYMENT.get("host_network"):
             cluster_data["spec"]["hostNetwork"] = True
             logger.info("Host network is enabled")
+            # follow the rule in bug DFBUGS-2324. UI adds this value by default if the ["spec"]["hostNetwork"] = True
+            # this prevents crashes on rgw installation
+            cluster_data["spec"].setdefault("managedResources", {}).setdefault(
+                "cephObjectStores", {}
+            )["hostNetwork"] = False
 
         cluster_data["spec"]["storageDeviceSets"] = [deviceset_data]
 
@@ -1588,11 +1734,12 @@ class Deployment(object):
                     )
                 cluster_data["spec"]["encryption"]["storageClass"] = True
 
+        managed_resources = cluster_data["spec"].setdefault("managedResources", {})
         if config.DEPLOYMENT.get("ceph_debug"):
             setup_ceph_debug()
-            cluster_data["spec"]["managedResources"] = {
-                "cephConfig": {"reconcileStrategy": "ignore"}
-            }
+            managed_resources.setdefault("cephConfig", {}).update(
+                {"reconcileStrategy": "ignore"}
+            )
         if config.ENV_DATA.get("is_multus_enabled"):
             public_net_name = config.ENV_DATA["multus_public_net_name"]
             public_net_namespace = config.ENV_DATA["multus_public_net_namespace"]
@@ -1780,13 +1927,36 @@ class Deployment(object):
                     upgrade_osd_requires_healthy_pgs
                 )
 
+        storage_cluster_override = config.DEPLOYMENT.get("storage_cluster_override", {})
+        if storage_cluster_override:
+            logger.info(
+                f"Override storage cluster data with: {storage_cluster_override}"
+            )
+            merge_dict(cluster_data, storage_cluster_override)
         cluster_data_yaml = tempfile.NamedTemporaryFile(
             mode="w+", prefix="cluster_storage", delete=False
         )
         templating.dump_data_to_temp_yaml(cluster_data, cluster_data_yaml.name)
 
         log_step("Create StorageCluster CR")
-        run_cmd(f"oc create -f {cluster_data_yaml.name}", timeout=1200)
+        storage_cluster_obj = ocp.OCP(
+            kind=constants.STORAGECLUSTER,
+            namespace=config.ENV_DATA["cluster_namespace"],
+        )
+        is_storagecluster = storage_cluster_obj.is_exist(
+            resource_name=constants.DEFAULT_STORAGE_CLUSTER
+        )
+
+        if config.ENV_DATA.get("odf_provider_mode_deployment", False):
+            if not is_storagecluster:
+                run_cmd(f"oc create -f {cluster_data_yaml.name}", timeout=1200)
+            else:
+                logger.info(
+                    f"StorageCluster {constants.DEFAULT_STORAGE_CLUSTER} already exists, skipping creation."
+                )
+        else:
+            run_cmd(f"oc create -f {cluster_data_yaml.name}", timeout=1200)
+
         if config.DEPLOYMENT["infra_nodes"]:
             log_step("Labeling infra nodes")
             _ocp = ocp.OCP(kind="node")
@@ -1872,7 +2042,7 @@ class Deployment(object):
             ui_deployment = config.DEPLOYMENT.get("ui_deployment")
             if not ui_deployment:
                 logger.info("Creating namespace and operator group.")
-                run_cmd(f"oc create -f {constants.OLM_YAML}")
+                run_cmd(f"oc apply -f {constants.OLM_YAML}")
             if not live_deployment:
                 create_catalog_source()
             self.subscribe_ocs()
@@ -1918,7 +2088,8 @@ class Deployment(object):
             label_pod_security_admission(
                 namespace=constants.OPENSHIFT_STORAGE_EXTENDED_NAMESPACE
             )
-            exec_cmd(f"oc create -f {constants.STORAGE_SYSTEM_ODF_EXTERNAL}")
+            if is_storage_system_needed():
+                exec_cmd(f"oc create -f {constants.STORAGE_SYSTEM_ODF_EXTERNAL}")
         else:
             cluster_data["metadata"]["name"] = config.ENV_DATA["storage_cluster_name"]
 
@@ -2045,6 +2216,23 @@ class Deployment(object):
             f"deployment {deployments_string}"
         )
 
+    @retry(exception_to_check=AssertionError, tries=12, delay=30, backoff=1)
+    def objectstore_user_check(self):
+        if self.platform in [constants.BAREMETAL_PLATFORM, constants.VSPHERE_PLATFORM]:
+            logger.info("Checking cephobjectstore user exist for bug: DFBUGS-2929")
+            cephobjectstoreuser = ocp.OCP(
+                kind="cephobjectstoreuser",
+                namespace=self.namespace,
+            )
+            cephobjectstoreusers = cephobjectstoreuser.get()["items"]
+            for objectstoreuser in cephobjectstoreusers:
+                name = objectstoreuser["metadata"]["name"]
+                phase = objectstoreuser.get("status", {}).get("phase")
+                logger.info(f"ObjectStoreUser user: {name} is in phase: {phase}")
+                assert (
+                    phase != "ReconcileFailed"
+                ), f"ObjectStoreUser {name} is in phase: {phase}"
+
     def deploy_ocs(self):
         """
         Handle OCS deployment, since OCS deployment steps are common to any
@@ -2067,6 +2255,40 @@ class Deployment(object):
             "disconnected_env_skip_image_mirroring"
         ):
             image = prepare_disconnected_ocs_deployment()
+
+        if (
+            config.ENV_DATA.get("odf_provider_mode_deployment", False)
+            and not config.ENV_DATA["skip_ocs_deployment"]
+        ):
+            path = "/spec/routeAdmission"
+            value = '{wildcardPolicy: "WildcardsAllowed"}'
+            params = f"""[{{"op": "add", "path": "{path}", "value": {value}}}]"""
+            patch_cmd = (
+                f"patch {constants.INGRESSCONTROLLER} -n {constants.OPENSHIFT_INGRESS_OPERATOR_NAMESPACE} "
+                + f"default --type json -p '{params}'"
+            )
+            OCP().exec_oc_cmd(command=patch_cmd)
+
+            # Mark master nodes schedulable if mark_masters_schedulable: True
+            if config.ENV_DATA.get("mark_masters_schedulable", False):
+                path = "/spec/mastersSchedulable"
+                params = f"""[{{"op": "replace", "path": "{path}", "value": true}}]"""
+                scheduler_obj = ocp.OCP(
+                    kind=constants.SCHEDULERS_CONFIG,
+                    namespace=config.ENV_DATA["cluster_namespace"],
+                )
+                assert scheduler_obj.patch(
+                    params=params, format_type="json"
+                ), "Failed to run patch command to update control nodes as scheduleable"
+                # Allow ODF to be deployed on all nodes
+                logger.info("labeling all nodes as storage nodes")
+                nodes = get_all_nodes()
+                node_objs = get_node_objs(nodes)
+                label_nodes(nodes=node_objs, label=constants.OPERATOR_NODE_LABEL)
+            else:
+                logger.info("labeling worker nodes as storage nodes")
+                worker_node_objs = get_nodes(node_type=constants.WORKER_MACHINE)
+                label_nodes(nodes=worker_node_objs, label=constants.OPERATOR_NODE_LABEL)
 
         if config.DEPLOYMENT["external_mode"]:
             self.deploy_with_external_mode()
@@ -2188,7 +2410,7 @@ class Deployment(object):
 
         if (
             self.platform == constants.VSPHERE_PLATFORM
-            and version.get_semantic_ocs_version_from_config() >= version.VERSION_4_19
+            and version.get_semantic_ocs_version_from_config() >= version.VERSION_4_18
         ):
             # using try/except to not fail deployments since these values are good to have
             # for vsphere platform
@@ -2259,6 +2481,7 @@ class Deployment(object):
 
         # patch gp2/thin storage class as 'non-default'
         self.patch_default_sc_to_non_default()
+        self.objectstore_user_check()
 
     def deploy_lvmo(self):
         """
@@ -2442,7 +2665,13 @@ class Deployment(object):
             return
 
         if config.ENV_DATA.get("acm_hub_unreleased"):
-            self.deploy_acm_hub_unreleased()
+            if version.compare_versions(
+                f"{config.ENV_DATA.get('acm_version')} >= 2.14"
+            ):
+                self.deploy_acm_hub_unreleased_konflux()
+                self.deploy_multicluster_hub()
+            else:
+                self.deploy_acm_hub_unreleased()
         else:
             self.deploy_acm_hub_released()
             self.deploy_multicluster_hub()
@@ -2607,7 +2836,7 @@ class Deployment(object):
             f.write(data)
 
         logger.info("Creating ImageContentSourcePolicy")
-        run_cmd(f"oc create -f {constants.ACM_HUB_UNRELEASED_ICSP_YAML}")
+        run_cmd(f"oc apply -f {constants.ACM_HUB_UNRELEASED_ICSP_YAML}")
 
         logger.info("Writing tag data to snapshot.ver")
         acm_version = config.ENV_DATA.get("acm_version")
@@ -2652,7 +2881,7 @@ class Deployment(object):
         templating.dump_data_to_temp_yaml(
             acm_hub_namespace_yaml_data, acm_hub_namespace_manifest.name
         )
-        run_cmd(f"oc create -f {acm_hub_namespace_manifest.name}")
+        run_cmd(f"oc apply -f {acm_hub_namespace_manifest.name}")
 
         logger.info("Creating OperationGroup for ACM deployment")
         package_manifest = PackageManifest(
@@ -2660,7 +2889,7 @@ class Deployment(object):
         )
 
         run_cmd(
-            f"oc create -f {constants.ACM_HUB_OPERATORGROUP_YAML} -n {constants.ACM_HUB_NAMESPACE}"
+            f"oc apply -f {constants.ACM_HUB_OPERATORGROUP_YAML} -n {constants.ACM_HUB_NAMESPACE}"
         )
 
         logger.info("Creating ACM HUB Subscription")
@@ -2673,6 +2902,91 @@ class Deployment(object):
             tries=10,
             delay=2,
         )(package_manifest.get_current_csv)(channel, constants.ACM_HUB_OPERATOR_NAME)
+        acm_hub_subscription_yaml_data["spec"]["startingCSV"] = (
+            package_manifest.get_current_csv(
+                channel=channel, csv_pattern=constants.ACM_HUB_OPERATOR_NAME
+            )
+        )
+
+        acm_hub_subscription_manifest = tempfile.NamedTemporaryFile(
+            mode="w+", prefix="acm_hub_subscription_manifest", delete=False
+        )
+        templating.dump_data_to_temp_yaml(
+            acm_hub_subscription_yaml_data, acm_hub_subscription_manifest.name
+        )
+        run_cmd(f"oc create -f {acm_hub_subscription_manifest.name}")
+        logger.info("Sleeping for 90 seconds after subscribing to ACM")
+        time.sleep(90)
+        csv_name = package_manifest.get_current_csv(channel=channel)
+        csv = CSV(resource_name=csv_name, namespace=constants.ACM_HUB_NAMESPACE)
+        csv.wait_for_phase("Succeeded", timeout=720)
+        logger.info("ACM HUB Operator Deployment Succeeded")
+
+    def deploy_acm_hub_unreleased_konflux(self):
+        """
+        Handle ACM HUB unreleased image deployment for 2.14 and later version
+        """
+        logger.info("Creating Konflux Catalogsource for ACM ")
+        acm_konflux_catsrc_yaml_data = templating.load_yaml(
+            constants.ACM_CATALOGSOURCE_YAML
+        )
+
+        acm_image_tag = (
+            config.ENV_DATA.get("acm_unreleased_image")
+            or f"latest-{config.ENV_DATA.get('acm_version')}"
+        )
+        acm_konflux_catsrc_yaml_data["spec"][
+            "image"
+        ] = f"{constants.ACM_CATSRC_IMAGE}:{acm_image_tag}"
+
+        acm_konflux_catsrc_yaml_data_manifest = tempfile.NamedTemporaryFile(
+            mode="w+", prefix="acm_konflux_catsrc_yaml_data_manifest", delete=False
+        )
+        templating.dump_data_to_temp_yaml(
+            acm_konflux_catsrc_yaml_data, acm_konflux_catsrc_yaml_data_manifest.name
+        )
+        run_cmd(f"oc create -f {acm_konflux_catsrc_yaml_data_manifest.name}")
+
+        acm_operator_catsrc = CatalogSource(
+            resource_name="acm-dev-catalog",
+            namespace=constants.MARKETPLACE_NAMESPACE,
+        )
+        acm_operator_catsrc.wait_for_state("READY")
+
+        create_mce_catsrc()
+        channel = config.ENV_DATA.get("acm_hub_channel")
+        logger.info("Creating ACM HUB namespace")
+        acm_hub_namespace_yaml_data = templating.load_yaml(constants.NAMESPACE_TEMPLATE)
+        acm_hub_namespace_yaml_data["metadata"]["name"] = constants.ACM_HUB_NAMESPACE
+        acm_hub_namespace_manifest = tempfile.NamedTemporaryFile(
+            mode="w+", prefix="acm_hub_namespace_manifest", delete=False
+        )
+        templating.dump_data_to_temp_yaml(
+            acm_hub_namespace_yaml_data, acm_hub_namespace_manifest.name
+        )
+        run_cmd(f"oc apply -f {acm_hub_namespace_manifest.name}")
+
+        logger.info("Creating OperationGroup for ACM deployment")
+        package_manifest = PackageManifest(
+            resource_name=constants.ACM_HUB_OPERATOR_NAME,
+            selector="catalog=acm-dev-catalog",
+        )
+
+        run_cmd(
+            f"oc apply -f {constants.ACM_HUB_OPERATORGROUP_YAML} -n {constants.ACM_HUB_NAMESPACE}"
+        )
+
+        logger.info("Creating ACM HUB Subscription")
+        acm_hub_subscription_yaml_data = templating.load_yaml(
+            constants.ACM_HUB_SUBSCRIPTION_YAML
+        )
+        acm_hub_subscription_yaml_data["spec"]["channel"] = channel
+        retry(
+            (ResourceNameNotSpecifiedException, ChannelNotFound, CommandFailed),
+            tries=10,
+            delay=2,
+        )(package_manifest.get_current_csv)(channel, constants.ACM_HUB_OPERATOR_NAME)
+        acm_hub_subscription_yaml_data["spec"]["source"] = "acm-dev-catalog"
         acm_hub_subscription_yaml_data["spec"]["startingCSV"] = (
             package_manifest.get_current_csv(
                 channel=channel, csv_pattern=constants.ACM_HUB_OPERATOR_NAME
@@ -2823,8 +3137,8 @@ def create_catalog_source(image=None, ignore_upgrade=False):
     if not image:
         image = config.DEPLOYMENT.get("ocs_registry_image", "")
     if config.DEPLOYMENT.get("stage_rh_osbs"):
-        image = config.DEPLOYMENT.get("stage_index_image", constants.OSBS_BOUNDLE_IMAGE)
         ocp_version = version.get_semantic_ocp_version_from_config()
+        image = config.DEPLOYMENT.get("stage_index_image", constants.OSBS_BOUNDLE_IMAGE)
         osbs_image_tag = config.DEPLOYMENT.get(
             "stage_index_image_tag", f"v{ocp_version}"
         )
@@ -2835,7 +3149,7 @@ def create_catalog_source(image=None, ignore_upgrade=False):
             '["registry-proxy.engineering.redhat.com", "registry.stage.redhat.io"]'
             "}}}'"
         )
-        run_cmd(f"oc apply -f {constants.STAGE_IMAGE_CONTENT_SOURCE_POLICY_YAML}")
+        run_cmd(f"oc apply -f {constants.STAGE_IMAGE_DIGEST_MIRROR_SET_YAML}")
         wait_for_machineconfigpool_status("all", timeout=1800)
     if not ignore_upgrade:
         upgrade = config.UPGRADE.get("upgrade", False)
@@ -2868,11 +3182,10 @@ def create_catalog_source(image=None, ignore_upgrade=False):
         catalog_source_data["spec"][
             "image"
         ] = f"{image}:{image_tag if image_tag else 'latest'}"
-    # apply icsp if present in the catalog image
+    # apply idms if present in the catalog image
     image = f"{image}:{image_tag if image_tag else 'latest'}"
     insecure_mode = True if config.DEPLOYMENT.get("disconnected") else False
-
-    get_and_apply_icsp_from_catalog(image=image, insecure=insecure_mode)
+    get_and_apply_idms_from_catalog(image=image, insecure=insecure_mode)
 
     catalog_source_manifest = tempfile.NamedTemporaryFile(
         mode="w+", prefix="catalog_source_manifest", delete=False
@@ -3525,6 +3838,16 @@ class MultiClusterDROperatorsDeploy(object):
         oadp_data["spec"]["backupLocations"][0]["velero"]["objectStorage"][
             "bucket"
         ] = bucket_name
+        oadp_version = get_oadp_version(namespace=constants.ACM_HUB_BACKUP_NAMESPACE)
+        if version.compare_versions(f"{oadp_version} >= 1.5"):
+            # Remove 'restic' under 'configuration' if it exists
+            oadp_data["spec"]["configuration"].pop("restic", None)
+
+            # Add 'nodeAgent' under 'configuration'
+            oadp_data["spec"]["configuration"]["nodeAgent"] = {
+                "enable": True,
+                "uploaderType": "restic",
+            }
         oadp_yaml = tempfile.NamedTemporaryFile(mode="w+", prefix="oadp", delete=False)
         templating.dump_data_to_temp_yaml(oadp_data, oadp_yaml.name)
         run_cmd(f"oc create -f {oadp_yaml.name}")

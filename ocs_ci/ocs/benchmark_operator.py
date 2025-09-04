@@ -11,6 +11,7 @@ This operator can be used as an object or as a fixture
 import logging
 import tempfile
 import time
+import os
 
 # 3rd party modules
 import pytest
@@ -94,6 +95,10 @@ class BenchmarkOperator(object):
         self.worker_nodes = get_worker_nodes()
         self._clone_operator()
         self.dir += f"/{BMO_NAME}"
+        self._env = self.args.get("env", os.environ.copy())
+        self.kubeconfig_path = config.RUN.get("kubeconfig")
+        if self.kubeconfig_path:
+            self._env["KUBECONFIG"] = self.kubeconfig_path
 
         # to use the cache dropping pod, worker nodes need to be labeled.
         log.info("Labeling the worker nodes for cache-dropping enable.")
@@ -159,6 +164,7 @@ class BenchmarkOperator(object):
                 shell=True,
                 check=True,
                 cwd=self.dir,
+                env=self._env,
             )
         except Exception as ex:
             log.error(f"Failed to deploy benchmark operator : {ex}")
@@ -187,7 +193,7 @@ class BenchmarkOperator(object):
         switch_to_default_rook_cluster_project()
 
         log.info("Delete the benchmark-operator project")
-        run("make undeploy", shell=True, check=True, cwd=self.dir)
+        run("make undeploy", shell=True, check=True, cwd=self.dir, env=self._env)
         # Wait until the benchmark-operator project deleted
         self.ns_obj.wait_for_delete(resource_name=self.namespace, timeout=180)
 

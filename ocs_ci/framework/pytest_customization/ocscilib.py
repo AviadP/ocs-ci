@@ -9,6 +9,8 @@ pytest which proccess config and passes all params to pytest.
 
 import logging
 import os
+import shutil
+
 import pandas as pd
 import pytest
 from junitparser import JUnitXml
@@ -281,10 +283,12 @@ def pytest_addoption(parser):
     )
     parser.addoption(
         "--csv-change",
-        dest="csv_change",
+        dest="csv_changes",
+        action="append",
         help=(
             "Pattern or string to change in the CSV. Should contain the value to replace "
-            "from and the value to replace to, separated by '::'"
+            "from and the value to replace to, separated by '::', you can repeat this argument "
+            "multiple times if multiple images needs to be changed"
         ),
     )
     parser.addoption(
@@ -477,7 +481,20 @@ def gather_version_info_for_report(config):
 
         # add ceph version
         if not ocsci_config.ENV_DATA["mcg_only_deployment"]:
-            ceph_version = get_ceph_version()
+
+            managed_or_hcp_platform = (
+                ocsci_config.multicluster
+                and ocsci_config.ENV_DATA.get("platform", "").lower()
+                in constants.HCI_PC_OR_MS_PLATFORM
+                and ocsci_config.ENV_DATA.get("cluster_type", "").lower()
+                in [constants.MS_CONSUMER_TYPE, constants.HCI_CLIENT]
+            )
+            # provide ceph details of ceph cluster for client clusters. client clusters do not have ceph pods
+            if managed_or_hcp_platform:
+                with ocsci_config.RunWithProviderConfigContextIfAvailable():
+                    ceph_version = get_ceph_version()
+            else:
+                ceph_version = get_ceph_version()
             config._metadata["Ceph Version"] = ceph_version
 
             # add csi versions
@@ -529,6 +546,23 @@ def get_cli_param(config, name_of_param, default=None):
     return cli_param
 
 
+def set_cli_param(config, name_of_param, value):
+    """
+    This is helper function which set cli parameter in RUN section in
+    cli_params
+
+    Args:
+        config (pytest.config): Pytest config object
+        name_of_param (str): cli parameter name
+        value (any): value of parameter
+
+    Returns:
+        None
+    """
+    ocsci_config.RUN["cli_params"][name_of_param] = value
+    setattr(config.option, name_of_param, value)
+
+
 def process_cluster_cli_params(config):
     """
     Process cluster related cli parameters
@@ -543,13 +577,46 @@ def process_cluster_cli_params(config):
     """
     suffix = ocsci_config.cur_index + 1 if ocsci_config.multicluster else ""
     cluster_path = get_cli_param(config, f"cluster_path{suffix}")
+
+    # # # # # # # # # # # This block is an overwrite logic for dynamic configuration adjustments  # # # # # # # # # # #
+    if not cluster_path and ocsci_config.multicluster:
+
+        # Problem:
+        # In case of setting up multiple configuration files provided to run-ci, script expects path to have suffix + 1
+        # When running run-ci with single configuration, suffix is empty, but pytest script sets config.multicluster
+        # in time when loading marks.py module, if platform is 'hci_baremetal'
+        # When script dynamically adds configuration, makes ocsci_config.multicluster and adds suffix + 1 to config_path
+        # This leads to ClusterPathNotProvidedError
+        #
+        # Solution:
+        # to make script reach path in both scenarios we will copy content of cluster_path that does not have suffix to
+        # cluster_path that has suffix "1" or higher
+        if suffix:
+            if not os.path.exists(ocsci_config.ENV_DATA["cluster_path"]):
+                raise ClusterPathNotProvidedError(
+                    "Cluster path is not provided and cluster_path does not exist"
+                )
+            parent_path = os.path.dirname(ocsci_config.ENV_DATA["cluster_path"])
+            if suffix > 1:
+                # historically cluster_path for client clusters is set to
+                # '/ocs-ci/cluster_path/clusters/<cl-419-a>/openshift-cluster-dir', so we want to create path like
+                # '/ocs-ci/cluster_path/clusters/cluster_path2 for auth directory of a client cluster
+                parent_path = os.path.dirname(parent_path)
+            cluster_path = os.path.join(parent_path, f"cluster_path{suffix}")
+            # we do not want to move files from original folder and preserve original cluster folder because
+            # we don't want to bind cluster to some incremental number, because cluster may dynamically change
+            shutil.copytree(
+                ocsci_config.ENV_DATA["cluster_path"], cluster_path, dirs_exist_ok=True
+            )
+            set_cli_param(config, f"cluster_path{suffix}", cluster_path)
+
     if not cluster_path:
         raise ClusterPathNotProvidedError()
     cluster_path = os.path.expanduser(cluster_path)
     if not os.path.exists(cluster_path):
         os.makedirs(cluster_path)
 
-    # create kubeconfig if doesn't exists and OCP url and kubeadmin password is provided
+    # create kubeconfig if doesn't exist and OCP url and kubeadmin password is provided
     kubeconfig_path = os.path.join(
         cluster_path, ocsci_config.RUN["kubeconfig_location"]
     )
@@ -603,6 +670,25 @@ def process_cluster_cli_params(config):
 
     OCP.set_kubeconfig(os.path.join(cluster_path, kubeconfig_location))
     cluster_name = get_cli_param(config, f"cluster_name{suffix}")
+
+    # # # # # # # # # # # This block is an overwrite logic for dynamic configuration adjustments  # # # # # # # # # # #
+    if not cluster_name and ocsci_config.multicluster:
+        if ocsci_config.ENV_DATA["cluster_type"] == "provider":
+            # If cluster_name is not provided, and we are in multicluster mode
+            # we will create cluster_name with suffix
+            provider_name = get_cli_param(config, "cluster_name")
+            set_cli_param(config, f"cluster_name{suffix}", provider_name)
+            cluster_name = get_cli_param(config, f"cluster_name{suffix}")
+        elif ocsci_config.ENV_DATA["cluster_type"] in [
+            "consumer",
+            "hci_client",
+        ]:
+            # If cluster_name is not provided, and we are in multicluster mode
+            # we'll assign existing name to config.'cluster_name{suffix}' to have matching provided and dynamic config's
+            cluster_name = ocsci_config.ENV_DATA.get("cluster_name")
+            set_cli_param(config, f"cluster_name{suffix}", cluster_name)
+            cluster_name = get_cli_param(config, f"cluster_name{suffix}")
+
     ocsci_config.RUN["cli_params"]["teardown"] = get_cli_param(
         config, "teardown", default=False
     )
@@ -696,14 +782,29 @@ def process_cluster_cli_params(config):
     if ocp_installer_version:
         ocsci_config.DEPLOYMENT["installer_version"] = ocp_installer_version
         ocsci_config.RUN["client_version"] = ocp_installer_version
-    csv_change = get_cli_param(config, "--csv-change")
-    if csv_change:
-        csv_change = csv_change.split("::")
-        ocsci_config.DEPLOYMENT["csv_change_from"] = csv_change[0]
-        ocsci_config.DEPLOYMENT["csv_change_to"] = csv_change[1]
+    csv_changes = get_cli_param(config, "--csv-change")
+    if csv_changes:
+        csv_change_from = ocsci_config.DEPLOYMENT.get("csv_change_from", [])
+        csv_change_to = ocsci_config.DEPLOYMENT.get("csv_change_to", [])
+        for csv_change in csv_changes:
+            csv_change = csv_change.split("::")
+            csv_change_from.append(csv_change[0])
+            csv_change_to.append(csv_change[1])
+
     collect_logs_on_success_run = get_cli_param(config, "collect_logs_on_success_run")
     if collect_logs_on_success_run:
         ocsci_config.REPORTING["collect_logs_on_success_run"] = True
+    markers_arg = config.getoption("-m")
+    if any(
+        mark in markers_arg
+        for mark in [
+            "deployment",
+            "acm_import",
+            "ocs_upgrade",
+            "ocp_upgrade",
+        ]
+    ) or ocsci_config.RUN.get("cli_params").get("deploy"):
+        ocsci_config.REPORTING["dont_fail_on_collect_logs"] = True
     get_cli_param(config, "dev_mode")
     ceph_debug = get_cli_param(config, "ceph_debug")
     if ceph_debug:

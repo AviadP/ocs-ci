@@ -25,16 +25,11 @@ from ocs_ci.utility.utils import (
     run_cmd,
     wait_for_machineconfigpool_status,
     wipe_all_disk_partitions_for_node,
+    get_running_ocp_version,
 )
+from ocs_ci.ocs.ocp import OCP
+from ocs_ci.ocs.resources.catalog_source import CatalogSource, disable_specific_source
 
-IMAGE_SOURCE_POLICY = ocp.OCP(
-    kind="ImageContentSourcePolicy", namespace=constants.MARKETPLACE_NAMESPACE
-)
-OPTIONAL_OPERATOR_CATALOG_SOURCE = ocp.OCP(
-    kind=constants.CATSRC,
-    namespace=constants.MARKETPLACE_NAMESPACE,
-    resource_name="optional-operators",
-)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +53,13 @@ def setup_local_storage(storageclass):
     ocp_ga_version = get_ocp_ga_version(ocp_version)
     if not ocp_ga_version:
         create_optional_operators_catalogsource_non_ga()
+    try:
+        get_lso_channel()
+    except CommandFailed as ex:
+        if "not found" in str(ex):
+            create_optional_operators_catalogsource_non_ga(force=True)
+        else:
+            raise
 
     logger.info("Retrieving local-storage-operator data from yaml")
     lso_data = list(
@@ -89,7 +91,10 @@ def setup_local_storage(storageclass):
     lso_data_yaml = tempfile.NamedTemporaryFile(
         mode="w+", prefix="local_storage_operator", delete=False
     )
-    if not IMAGE_SOURCE_POLICY.is_exist(resource_name=lso_data_yaml.name):
+    image_source_policy = ocp.OCP(
+        kind="ImageContentSourcePolicy", namespace=constants.MARKETPLACE_NAMESPACE
+    )
+    if not image_source_policy.is_exist(resource_name=lso_data_yaml.name):
         templating.dump_data_to_temp_yaml(lso_data, lso_data_yaml.name)
         with open(lso_data_yaml.name, "r") as f:
             logger.info(f.read())
@@ -255,6 +260,7 @@ def create_optional_operators_catalogsource_non_ga(force=False):
             image = operator["spec"]["image"].split(":")[0]
             ocp_version_image = f"{image}:v{ocp_version}"
             operator["spec"]["image"] = ocp_version_image
+
     optional_operators_yaml = tempfile.NamedTemporaryFile(
         mode="w+", prefix="optional_operators", delete=False
     )
@@ -267,12 +273,12 @@ def create_optional_operators_catalogsource_non_ga(force=False):
     if config.DEPLOYMENT.get("disconnected"):
         # in case of disconnected environment, we have to mirror all the
         # optional_operators images
-        icsp = None
+        idms = None
         for _dict in optional_operators_data:
             if _dict.get("kind").lower() == "catalogsource":
                 index_image = _dict["spec"]["image"]
             if _dict.get("kind").lower() == "imagecontentsourcepolicy":
-                icsp = _dict
+                idms = _dict
         mirrored_index_image = (
             f"{config.DEPLOYMENT['mirror_registry']}/"
             f"{index_image.split('/', 1)[-1]}"
@@ -281,19 +287,24 @@ def create_optional_operators_catalogsource_non_ga(force=False):
             index_image,
             mirrored_index_image,
             constants.DISCON_CL_REQUIRED_PACKAGES,
-            icsp,
+            idms=idms,
         )
         _dict["spec"]["image"] = mirrored_index_image
     templating.dump_data_to_temp_yaml(
         optional_operators_data, optional_operators_yaml.name
     )
-    if not OPTIONAL_OPERATOR_CATALOG_SOURCE.is_exist():
+    optional_operator_catalog_source = ocp.OCP(
+        kind=constants.CATSRC,
+        namespace=constants.MARKETPLACE_NAMESPACE,
+        resource_name="optional-operators",
+    )
+    if not optional_operator_catalog_source.is_exist():
         with open(optional_operators_yaml.name, "r") as f:
             logger.info(f.read())
         logger.info(
             "Creating optional operators CatalogSource and ImageContentSourcePolicy"
         )
-        run_cmd(f"oc create -f {optional_operators_yaml.name}")
+        run_cmd(f"oc apply -f {optional_operators_yaml.name}")
     wait_for_machineconfigpool_status("all")
 
 
@@ -488,3 +499,142 @@ def cleanup_nodes_for_lso_install():
         for node_obj in node_objs:
             clean_disk(node_obj)
         logger.info("All nodes are wiped")
+
+
+def catalog_source_created(catalogsource_name, namespace=None):
+    """
+    Check if catalog source is created
+
+    Returns:
+        bool: True if catalog source is created, False otherwise
+    """
+    if not namespace:
+        namespace = constants.MARKETPLACE_NAMESPACE
+    return CatalogSource(
+        resource_name=catalogsource_name,
+        namespace=namespace,
+    ).check_resource_existence(
+        timeout=60,
+        should_exist=True,
+        resource_name=catalogsource_name,
+    )
+
+
+def lso_operator_installed(namespace=None):
+    """ "
+    Check lso operator is installed or not
+
+    Returns:
+            bool: True if Local Storage instance is created, False otherwise
+    """
+    namespace = config.ENV_DATA["local_storage_namespace"]
+    if not namespace:
+        namespace = constants.LOCAL_STORAGE_NAMESPACE
+    return OCP(
+        kind=constants.SUBSCRIPTION_WITH_ACM,
+        namespace=namespace,
+        resource_name=constants.LOCAL_STORAGE_OPERATOR_NAME,
+    ).check_resource_existence(
+        timeout=60,
+        should_exist=True,
+        resource_name=constants.LOCAL_STORAGE_OPERATOR_NAME,
+    )
+
+
+def running_lso_version(namespace=None):
+    """
+    This method is to fetch the running lso version
+
+    Returns:
+            string: metalLB version
+    """
+    namespace = config.ENV_DATA["local_storage_namespace"]
+    if not namespace:
+        namespace = constants.LOCAL_STORAGE_NAMESPACE
+    lso_subs_obj = OCP(
+        kind=constants.SUBSCRIPTION_WITH_ACM,
+        namespace=namespace,
+        resource_name=constants.LOCAL_STORAGE_CSV_PREFIX,
+    )
+    lso_version = lso_subs_obj.get()["status"]["installedCSV"]
+    lso_version = lso_version.split(".v")[1].split("-")[0]
+    return lso_version
+
+
+def lso_upgrade():
+    """
+    Upgrade lso operator
+
+    """
+    import time
+    from pkg_resources import parse_version
+    from ocs_ci.ocs.resources.install_plan import wait_for_install_plan_and_approve
+
+    lso_namespace = config.ENV_DATA["local_storage_namespace"]
+    # check lso operator is available or not
+    lso_subs_obj = OCP(
+        kind=constants.SUBSCRIPTION_WITH_ACM,
+        namespace=lso_namespace,
+        resource_name=constants.LOCAL_STORAGE_CSV_PREFIX,
+    )
+    optional_operators_catsrc = CatalogSource(
+        resource_name=constants.OPTIONAL_OPERATORS,
+        namespace=constants.MARKETPLACE_NAMESPACE,
+    )
+    redhat_operators_catsrc = CatalogSource(
+        resource_name=constants.OPERATOR_CATALOG_SOURCE_NAME,
+        namespace=constants.MARKETPLACE_NAMESPACE,
+    )
+    logger.info("Check if lso is installed")
+    if not lso_operator_installed():
+        logger.error("lso operator unavailable")
+        return False
+
+    logger.info(f"Currently installed lso version: {running_lso_version()}")
+    upgrade_to_version = config.UPGRADE.get("upgrade_lso_version")
+    if not upgrade_to_version:
+        upgrade_to_version = get_running_ocp_version()
+    logger.info(f"Upgarde lso version to: {parse_version(upgrade_to_version)}")
+    if parse_version(upgrade_to_version) == parse_version(running_lso_version()):
+        logger.info("Lso operator is not upgradeable")
+        return True
+    ocp_version = version.get_semantic_ocp_version_from_config()
+    ocp_ga_version = get_ocp_ga_version(ocp_version)
+    if not ocp_ga_version:
+        if not catalog_source_created(catalogsource_name=constants.OPTIONAL_OPERATORS):
+            create_optional_operators_catalogsource_non_ga()
+        else:
+            logger.info(f"Catalog Source {constants.OPTIONAL_OPERATORS} already exists")
+            # update image in catalogsource
+            patch = (
+                f'{{"spec": {{'
+                f'"image": "quay.io/openshift-qe-optional-operators/aosqe-index:{upgrade_to_version}"'
+                f"}}}}"
+            )
+        disable_specific_source(constants.OPTIONAL_OPERATORS)
+        optional_operators_catsrc.wait_for_state("READY")
+
+        # update subscription
+        patch = (
+            f'{{"spec": {{"channel": "{get_lso_channel()}", '
+            f'"source": "{constants.OPTIONAL_OPERATORS}"}}}}'
+        )
+        lso_subs_obj.patch(params=patch, format_type="merge")
+
+    elif ocp_ga_version:
+        disable_specific_source(constants.OPERATOR_CATALOG_SOURCE_NAME)
+        patch = f'{{"spec": {{"image": "registry.redhat.io/redhat/redhat-operator-index:{upgrade_to_version}"}}}}'
+        redhat_operators_catsrc.patch(params=patch, format_type="merge")
+        # wait for catalog source is ready
+        redhat_operators_catsrc.wait_for_state("READY")
+
+    if lso_subs_obj.get()["spec"]["installPlanApproval"] != "Automatic":
+        patch = '{"spec": {"installPlanApproval": "Automatic"}}'
+        lso_subs_obj.patch(params=patch, format_type="merge")
+        wait_for_install_plan_and_approve(lso_namespace)
+
+    # wait for sometime before checking the latest lso version
+    time.sleep(60)
+    lso_version_post_upgrade = running_lso_version()
+    logger.info(f"lso version post upgrade: {lso_version_post_upgrade}")
+    return upgrade_to_version in lso_version_post_upgrade

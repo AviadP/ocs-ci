@@ -1,3 +1,4 @@
+import json
 import logging
 import gc
 
@@ -128,7 +129,7 @@ class TestReplication(MCGTest):
                     "interface": "CLI",
                     "backingstore_dict": {"gcp": [(1, None)]},
                 },
-                marks=[tier1],
+                marks=[tier2],
             ),
         ],
         ids=[
@@ -230,7 +231,11 @@ class TestReplication(MCGTest):
         namespacestore_aws_s3_creds = {
             "access_key_id": cld_mgr.aws_client.access_key,
             "access_key": cld_mgr.aws_client.secret_key,
-            "endpoint": constants.AWS_S3_ENDPOINT,
+            "endpoint": constants.MCG_NS_AWS_ENDPOINT.format(
+                source_bucketclass["namespace_policy_dict"]["namespacestore_dict"][
+                    "aws"
+                ][0][1]
+            ),
             "region": source_bucketclass["namespace_policy_dict"][
                 "namespacestore_dict"
             ]["aws"][0][1],
@@ -396,7 +401,7 @@ class TestReplication(MCGTest):
                     "interface": "OC",
                     "backingstore_dict": {"gcp": [(1, None)]},
                 },
-                marks=[tier1],
+                marks=[tier2],
             ),
             pytest.param(
                 {
@@ -500,12 +505,13 @@ class TestReplication(MCGTest):
             logger.info(f"Deleted source bucket {source_bucket_name}")
 
             # check in db that the replication config was deleted
-            replication_conf_count = exec_nb_db_query(
-                f"SELECT COUNT (*) FROM replicationconfigs WHERE _id='{replication_id}'"
+            replication_conf_data_str = exec_nb_db_query(
+                f"SELECT data FROM replicationconfigs WHERE _id='{replication_id}'"
             )[0].strip()
+            replication_conf_data_dict = json.loads(replication_conf_data_str)
 
             assert (
-                int(replication_conf_count) == 0
+                "deleted" in replication_conf_data_dict
             ), f"Replication config for {source_bucket_name} is not deleted!"
 
             # check in noobaa core logs

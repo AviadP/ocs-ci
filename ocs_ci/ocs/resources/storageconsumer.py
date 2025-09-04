@@ -2,16 +2,26 @@
 A module for all StorageConsumer functionalities and abstractions.
 """
 
+import concurrent
+import json
 import logging
 import tempfile
+from concurrent.futures.thread import ThreadPoolExecutor
 
-from ocs_ci.framework import config
+from ocs_ci.framework import config, config_safe_thread_pool_task
+from ocs_ci.framework.logger_helper import log_step
+from ocs_ci.helpers.helpers import get_cephfs_subvolumegroup_names
 from ocs_ci.ocs import constants, ocp
+from ocs_ci.ocs.managedservice import get_consumer_names
+from ocs_ci.ocs.rados_utils import fetch_rados_namespaces, fetch_pool_names
 from ocs_ci.ocs.resources.ocs import OCS
+from ocs_ci.ocs.resources.storage_cluster import StorageCluster
 from ocs_ci.ocs.version import if_version
 from ocs_ci.utility import templating
+from ocs_ci.utility.retry import retry
 from ocs_ci.utility.templating import dump_data_to_temp_yaml
-from ocs_ci.utility.utils import exec_cmd
+from ocs_ci.utility.utils import exec_cmd, TimeoutSampler, is_cluster_y_version_upgraded
+from ocs_ci.utility.version import get_semantic_version
 
 log = logging.getLogger(__name__)
 
@@ -120,6 +130,17 @@ class StorageConsumer:
                 resource_name=self.heartbeat_cronjob.name, params=patch_param
             )
 
+    def get_uid(self):
+        """
+        Get the UID of the StorageConsumer resource.
+
+        Returns:
+            str: UID of the StorageConsumer resource
+
+        """
+        with config.RunWithConfigContext(self.consumer_context):
+            return self.ocp.get(resource_name=self.name).get("metadata").get("uid")
+
     def get_heartbeat_cronjob(self):
         """
         Returns:
@@ -163,6 +184,18 @@ class StorageConsumer:
         with config.RunWithConfigContext(self.consumer_context):
             return self.ocp.get(resource_name=self.name).get("status").get("client")
 
+    @if_version(">4.18")
+    def get_state(self):
+        """
+        Get state from storageconsumer resource.
+
+        Returns:
+            string: state of the storage consumer
+
+        """
+        with config.RunWithConfigContext(self.consumer_context):
+            return self.ocp.get(resource_name=self.name).get("status").get("state")
+
     def get_storage_quota_in_gib(self):
         """
         Get storage quota in GiB from storageconsumer resource.
@@ -190,11 +223,16 @@ class StorageConsumer:
 
         """
         with config.RunWithConfigContext(self.consumer_context):
-            return (
+            resource_name_mapping_config_map = (
                 self.ocp.get(resource_name=self.name)
-                .get("spec")
+                .get("status")
                 .get("resourceNameMappingConfigMap")
             )
+        return (
+            resource_name_mapping_config_map["name"]
+            if resource_name_mapping_config_map
+            else None
+        )
 
     @if_version(">4.18")
     def get_resource_name_mapping_config_map_from_status(self):
@@ -223,9 +261,27 @@ class StorageConsumer:
 
         """
         with config.RunWithConfigContext(self.consumer_context):
-            return (
+            sc_list = (
                 self.ocp.get(resource_name=self.name).get("spec").get("storageClasses")
             )
+        return [sc["name"] for sc in sc_list] if sc_list else []
+
+    @if_version(">4.18")
+    def get_volume_snapshot_classes(self):
+        """
+        Get volume snapshot classes from storageconsumer resource.
+
+        Returns:
+            list: volume snapshot classes
+
+        """
+        with config.RunWithConfigContext(self.consumer_context):
+            vsc_list = (
+                self.ocp.get(resource_name=self.name)
+                .get("spec")
+                .get("volumeSnapshotClasses")
+            )
+        return [sc["name"] for sc in vsc_list] if vsc_list else []
 
     def set_storage_quota_in_gib(self, quota):
         """
@@ -240,17 +296,27 @@ class StorageConsumer:
             self.ocp.patch(resource_name=self.name, params=patch_param)
 
     @if_version(">4.18")
-    def set_storage_classes(self, storage_class):
+    def set_storage_classes(self, storage_classes):
         """
-        Add storage class to storageconsumer resource and apply patch.
+        Add one or multiple storage classes to the storageconsumer resource and apply patch.
 
         Args:
-            storage_class (string): storage class
+            storage_classes (str or list): A single storage class as a string or a list of storage classes.
 
         """
+        if isinstance(storage_classes, str):
+            storage_classes = [storage_classes]
+
+        if not isinstance(storage_classes, list):
+            raise ValueError("storage_classes must be a string or a list of strings")
+
+        storage_classes_list = [{"name": sc} for sc in storage_classes]
+        storage_classes_json = json.dumps(storage_classes_list)
         with config.RunWithConfigContext(self.consumer_context):
-            patch_param = f'{{"spec": {{"storageClasses": ["{storage_class}"]}}}}'
-            self.ocp.patch(resource_name=self.name, params=patch_param)
+            patch_param = f'{{"spec": {{"storageClasses": {storage_classes_json}}}}}'
+            self.ocp.patch(
+                resource_name=self.name, params=patch_param, format_type="merge"
+            )
 
     @if_version(">4.18")
     def remove_custom_storage_class(self, storage_class):
@@ -341,6 +407,7 @@ class StorageConsumer:
                 self.ocp.patch(resource_name=self.name, params=patch_param)
 
     @if_version(">4.18")
+    @retry((AttributeError, KeyError), tries=10, delay=5)
     def get_onboarding_ticket_secret(self):
         """
         Get OnboardingTicketSecret from storageconsumer resource status. Optional field.
@@ -389,15 +456,17 @@ class StorageConsumer:
             storage_consumer_data["metadata"]["namespace"] = self.namespace
             if storage_classes:
                 storage_consumer_data["spec"].setdefault(
-                    "storageClasses", storage_classes
+                    "storageClasses", [{"name": sc} for sc in storage_classes]
                 )
             if volume_snapshot_classes:
                 storage_consumer_data["spec"].setdefault(
-                    "volumeSnapshotClasses", volume_snapshot_classes
+                    "volumeSnapshotClasses",
+                    [{"name": vsc} for vsc in volume_snapshot_classes],
                 )
             if volume_group_snapshot_classes:
                 storage_consumer_data["spec"].setdefault(
-                    "volumeGroupSnapshotClasses", volume_group_snapshot_classes
+                    "volumeGroupSnapshotClasses",
+                    [{"name": vgsc} for vgsc in volume_group_snapshot_classes],
                 )
             if storage_quota_in_gib:
                 storage_consumer_data["spec"].setdefault(
@@ -414,6 +483,21 @@ class StorageConsumer:
             dump_data_to_temp_yaml(storage_consumer_data, storage_consumer_file.name)
 
             return self.ocp.create(yaml_file=storage_consumer_file.name)
+
+    def get_owner_references(self):
+        """
+        Get owner references of the storage consumer.
+
+        Returns:
+            list: List of owner references
+
+        """
+        with config.RunWithConfigContext(self.consumer_context):
+            return (
+                self.ocp.get(resource_name=self.name)
+                .get("metadata")
+                .get("ownerReferences")
+            )
 
 
 def create_storage_consumer_on_default_cluster(
@@ -439,9 +523,8 @@ def create_storage_consumer_on_default_cluster(
         StorageConsumer: StorageConsumer object
 
     """
-    consumer_context = config.cluster_ctx.ENV_DATA.get(
-        "default_cluster_context_index", 0
-    )
+    # as of ODF 4.19 timeline, StorageConsumer cr must exist on the provider cluster only
+    consumer_context = config.get_provider_index()
     storage_consumer = StorageConsumer(
         consumer_name, config.ENV_DATA["cluster_namespace"], consumer_context
     )
@@ -453,3 +536,673 @@ def create_storage_consumer_on_default_cluster(
         resource_name_mapping_config_map_name=resource_name_mapping_config_map_name,
     )
     return storage_consumer
+
+
+@if_version(">4.18")
+def verify_storage_consumer_resources(
+    consumer_name,
+    distributed_storage_classes=None,
+    distributed_volume_snapshot_classes=None,
+):
+    """
+    Function to Verify resources:
+    ConfigMap of each client includes name of each cephclient of that client
+    OwnerRef of each StorageConsumer is StorageCluster, matches the uid of StorageCluster
+    metadata.uid of storageconsumer matches the cephclient names sufixes in postDeployment
+    StorageCluster uid matches the internal StorageConsumer uid
+    StorageConsumer has StorageClasses and VolumeSnapshotClasses that are available on the cluster
+
+    Args:
+        consumer_name (str): Name of the storage consumer
+        distributed_storage_classes (list): List of distributed storage classes
+        distributed_volume_snapshot_classes (list): List of distributed volume snapshot classes
+
+    Raises:
+        AssertionError: If any of the checks fail
+
+    """
+    internal_consumer = consumer_name == constants.INTERNAL_STORAGE_CONSUMER_NAME
+    if internal_consumer and distributed_storage_classes:
+        raise AssertionError(
+            "Distributed storage classes arguments are not expected for internal storage consumer."
+        )
+    if internal_consumer and distributed_volume_snapshot_classes:
+        raise AssertionError(
+            "Distributed volume snapshot classes arguments are not expected for internal storage consumer."
+        )
+
+    # as of ODF 4.19 timeline, StorageConsumer cr must exist on the provider cluster only
+    consumer_context = config.cluster_ctx.ENV_DATA.get(
+        "default_cluster_context_index", 0
+    )
+    storage_consumer = StorageConsumer(
+        consumer_name, config.ENV_DATA["cluster_namespace"], consumer_context
+    )
+    storage_consumer_uid = storage_consumer.get_uid()
+
+    log_step(
+        f"Collect initial resources and verify StorageConsumer {consumer_name} exists"
+    )
+    storage_cluster = StorageCluster(
+        resource_name=config.cluster_ctx.ENV_DATA["storage_cluster_name"],
+        namespace=config.ENV_DATA["cluster_namespace"],
+    )
+    sc_uid = storage_cluster.get().get("metadata", {}).get("uid")
+    if not sc_uid:
+        raise AssertionError(
+            f"StorageCluster {config.cluster_ctx.ENV_DATA['storage_cluster_name']} has no uid."
+        )
+
+    log_step(f"Verifying StorageConsumer Owner References for {consumer_name}")
+    owner_ref = storage_consumer.get_owner_references()
+    if not owner_ref:
+        raise AssertionError(
+            f"StorageConsumer {consumer_name} has no owner references."
+        )
+
+    storage_cluster_refs = [
+        ref for ref in owner_ref if ref.get("kind").lower() == constants.STORAGECLUSTER
+    ]
+    if not storage_cluster_refs:
+        raise AssertionError(
+            f"StorageConsumer {consumer_name} has no valid StorageCluster owner references."
+        )
+
+    for ref in owner_ref:
+        # skip owner references which are not StorageCluster
+        # fail if no StorageCluster owner reference
+        if ref.get("kind").lower() != constants.STORAGECLUSTER:
+            continue
+
+        if ref.get("name") != config.cluster_ctx.ENV_DATA["storage_cluster_name"]:
+            raise AssertionError(
+                f"StorageConsumer {consumer_name} owner reference name is not "
+                f"'{config.cluster_ctx.ENV_DATA['storage_cluster_name']}'."
+            )
+
+        if ref.get("uid") != sc_uid:
+            raise AssertionError(
+                f"StorageConsumer {consumer_name} owner reference uid "
+                f"{ref.get('uid')} does not match StorageCluster uid {sc_uid}."
+            )
+
+    log_step(
+        "Verifying StorageConsumer StorageClasses. "
+        "Cluster must have available StorageClasses that are listed in StorageConsumer"
+    )
+    if internal_consumer:
+        storage_classes_on_consumer = storage_consumer.get_storage_classes()
+        storage_classes_ocp = ocp.OCP(
+            kind=constants.STORAGECLASS, namespace=config.ENV_DATA["cluster_namespace"]
+        ).get()
+        storage_class_names_on_cluster = [
+            item["metadata"]["name"] for item in storage_classes_ocp["items"]
+        ]
+        for storage_class in storage_classes_on_consumer:
+            if storage_class not in storage_class_names_on_cluster:
+                raise AssertionError(
+                    f"StorageClass {storage_class} is not available on the cluster "
+                    f"but listed in storage consumer {consumer_name}."
+                )
+    else:
+        if distributed_storage_classes:
+            storage_classes_on_consumer = storage_consumer.get_storage_classes()
+            for storage_class in distributed_storage_classes:
+                if storage_class not in storage_classes_on_consumer:
+                    raise AssertionError(
+                        f"StorageClass {storage_class} is not listed in the StorageConsumer {consumer_name}."
+                    )
+        else:
+            log.info(
+                f"StorageConsumer {consumer_name} has no StorageClasses provided with function call,"
+                "skipping verification of StorageClasses on cluster."
+            )
+
+    log_step(
+        "Verifying StorageConsumer VolumeSnapshotClasses. "
+        "Cluster must have available VolumeSnapshotClasses that are listed in StorageConsumer"
+    )
+
+    if internal_consumer:
+        volume_snapshot_classes_on_consumer = (
+            storage_consumer.get_volume_snapshot_classes()
+        )
+        volume_snapshot_classes_ocp = ocp.OCP(
+            kind=constants.VOLUMESNAPSHOTCLASS,
+            namespace=config.ENV_DATA["cluster_namespace"],
+        ).get()
+        volume_snapshot_class_names_on_cluster = [
+            item["metadata"]["name"] for item in volume_snapshot_classes_ocp["items"]
+        ]
+        for volume_snapshot_class in volume_snapshot_classes_on_consumer or []:
+            if volume_snapshot_class not in volume_snapshot_class_names_on_cluster:
+                raise AssertionError(
+                    f"VolumeSnapshotClass {volume_snapshot_class} is not available on the cluster "
+                    f"but listed in storage consumer {consumer_name}."
+                )
+    else:
+        if distributed_volume_snapshot_classes:
+            volume_snapshot_classes_on_consumer = (
+                storage_consumer.get_volume_snapshot_classes()
+            )
+            for volume_snapshot_class in distributed_volume_snapshot_classes:
+                if volume_snapshot_class not in volume_snapshot_classes_on_consumer:
+                    raise AssertionError(
+                        f"VolumeSnapshotClass {volume_snapshot_class} "
+                        f"is not listed in the StorageConsumer {consumer_name}."
+                    )
+        else:
+            log.info(
+                f"StorageConsumer {consumer_name} has no VolumeSnapshotClasses provided with function call, "
+                "skipping verification of VolumeSnapshotClasses on cluster."
+            )
+
+    log_step("Verifying StorageConsumer ResourceNameMappingConfigMap")
+    resource_name_mapping_config_map = (
+        storage_consumer.get_resource_name_mapping_config_map_from_spec()
+    )
+    if not resource_name_mapping_config_map:
+        raise AssertionError(
+            f"StorageConsumer {consumer_name} has no ResourceNameMappingConfigMap."
+        )
+    ceph_data_on_consumer_match = verify_consumer_configmap(
+        consumer_name,
+        internal_consumer,
+        resource_name_mapping_config_map,
+        storage_consumer_uid,
+    )
+    log.info(
+        f"StorageConsumer config map data match:\n "
+        f"{json.dumps(ceph_data_on_consumer_match, indent=2)}"
+    )
+    assert all(ceph_data_on_consumer_match.values()), (
+        f"StorageConsumer config map data does not match expected values. Consumer name: {consumer_name};"
+        f"ODF Operator upgraded: {is_cluster_y_version_upgraded()}; "
+    )
+
+
+@if_version(">4.18")
+def verify_consumer_configmap(
+    consumer_name, internal_consumer, config_map_name, storage_consumer_uid
+):
+
+    config_map_obj = ocp.OCP(
+        kind=constants.CONFIGMAP,
+        namespace=config.cluster_ctx.ENV_DATA["cluster_namespace"],
+        resource_name=config_map_name,
+    ).get()
+    ceph_data = config_map_obj.get("data", {})
+    ceph_data_on_consumer_match = {}
+    disable_blockpools = config.COMPONENTS["disable_blockpools"]
+    disable_cephfs = config.COMPONENTS["disable_cephfs"]
+
+    def convergence_ver(version):
+        return get_semantic_version(
+            version, only_major_minor=True
+        ) == get_semantic_version("4.19", only_major_minor=True)
+
+    def _handle_storageconsumer_ceph_client_names_fresh_converged(
+        ceph_data_arg, ceph_data_on_consumer_match_arg, storage_consumer_uid_arg
+    ):
+        """
+        Handle post-converged client names for ceph data on consumer match.
+
+        Args:
+            ceph_data_arg (dict): The ceph data dictionary from the config map.
+            ceph_data_on_consumer_match_arg (dict): The dictionary to store the match results.
+            storage_consumer_uid_arg (str): The UID of the storage consumer.
+        """
+
+        ceph_data_on_consumer_match_arg["csi-cephfs-node-ceph-user"] = (
+            ceph_data_arg.get("csi-cephfs-node-ceph-user", "")
+            == f"csi-cephfs-node-{storage_consumer_uid_arg}"
+        )
+        ceph_data_on_consumer_match_arg["csi-cephfs-provisioner-ceph-user"] = (
+            ceph_data_arg.get("csi-cephfs-provisioner-ceph-user", "")
+            == f"csi-cephfs-provisioner-{storage_consumer_uid_arg}"
+        )
+        ceph_data_on_consumer_match_arg["csi-rbd-node-ceph-user"] = (
+            ceph_data_arg.get("csi-rbd-node-ceph-user", "")
+            == f"csi-rbd-node-{storage_consumer_uid_arg}"
+        )
+        ceph_data_on_consumer_match_arg["csi-rbd-provisioner-ceph-user"] = (
+            ceph_data_arg.get("csi-rbd-provisioner-ceph-user", "")
+            == f"csi-rbd-provisioner-{storage_consumer_uid_arg}"
+        )
+        ceph_data_on_consumer_match_arg["csiop-cephfs-client-profile"] = (
+            ceph_data_arg.get("csiop-cephfs-client-profile", "")
+            == storage_consumer_uid_arg
+        )
+        ceph_data_on_consumer_match_arg["csiop-rbd-client-profile"] = (
+            ceph_data_arg.get("csiop-rbd-client-profile", "")
+            == storage_consumer_uid_arg
+        )
+
+    def _handle_storageconsumer_ceph_client_names_upgraded_converged(
+        ceph_data_arg, ceph_data_on_consumer_match_arg, storage_consumer_uid_arg
+    ):
+        """
+        Handle post-converged client names for ceph data on consumer match.
+
+        Args:
+            ceph_data_arg (dict): The ceph data dictionary from the config map.
+            ceph_data_on_consumer_match_arg (dict): The dictionary to store the match results.
+            storage_consumer_uid_arg (str): The UID of the storage consumer.
+        """
+
+        ceph_data_on_consumer_match_arg["csi-cephfs-node-ceph-user"] = (
+            ceph_data_arg.get("csi-cephfs-node-ceph-user", "")
+            == f"cephfs-node-{storage_consumer_uid_arg}"
+        )
+        ceph_data_on_consumer_match_arg["csi-cephfs-provisioner-ceph-user"] = (
+            ceph_data_arg.get("csi-cephfs-provisioner-ceph-user", "")
+            == f"cephfs-provisioner-{storage_consumer_uid_arg}"
+        )
+        ceph_data_on_consumer_match_arg["csi-rbd-node-ceph-user"] = (
+            ceph_data_arg.get("csi-rbd-node-ceph-user", "")
+            == f"rbd-node-{storage_consumer_uid_arg}"
+        )
+        ceph_data_on_consumer_match_arg["csi-rbd-provisioner-ceph-user"] = (
+            ceph_data_arg.get("csi-rbd-provisioner-ceph-user", "")
+            == f"rbd-provisioner-{storage_consumer_uid_arg}"
+        )
+        ceph_data_on_consumer_match_arg["csiop-cephfs-client-profile"] = (
+            ceph_data_arg.get("csiop-cephfs-client-profile", "")
+            == storage_consumer_uid_arg
+        )
+        ceph_data_on_consumer_match_arg["csiop-rbd-client-profile"] = (
+            ceph_data_arg.get("csiop-rbd-client-profile", "")
+            == storage_consumer_uid_arg
+        )
+
+    def _handle_converged_client_ceph_names(
+        ceph_data_arg, ceph_data_on_consumer_match_arg
+    ):
+        """
+        Handle post-converged client names for ceph data on consumer match.
+
+        Args:
+            ceph_data_arg (dict): The ceph data dictionary from the config map.
+            ceph_data_on_consumer_match_arg (dict): The dictionary to store the match results.
+
+        """
+        ceph_data_on_consumer_match_arg["csi-cephfs-node-ceph-user"] = (
+            ceph_data_arg.get("csi-cephfs-node-ceph-user", "") == "rook-csi-cephfs-node"
+        )
+        ceph_data_on_consumer_match_arg["csi-cephfs-provisioner-ceph-user"] = (
+            ceph_data_arg.get("csi-cephfs-provisioner-ceph-user", "")
+            == "rook-csi-cephfs-provisioner"
+        )
+        ceph_data_on_consumer_match_arg["csi-rbd-node-ceph-user"] = (
+            ceph_data_arg.get("csi-rbd-node-ceph-user", "") == "rook-csi-rbd-node"
+        )
+        ceph_data_on_consumer_match_arg["csi-rbd-provisioner-ceph-user"] = (
+            ceph_data_arg.get("csi-rbd-provisioner-ceph-user", "")
+            == "rook-csi-rbd-provisioner"
+        )
+        ceph_data_on_consumer_match_arg["csiop-cephfs-client-profile"] = (
+            ceph_data_arg.get("csiop-cephfs-client-profile", "")
+            == config.cluster_ctx.ENV_DATA["cluster_namespace"]
+        )
+        ceph_data_on_consumer_match_arg["csiop-rbd-client-profile"] = (
+            ceph_data_arg.get("csiop-rbd-client-profile", "")
+            == config.cluster_ctx.ENV_DATA["cluster_namespace"]
+        )
+
+    if internal_consumer and not (disable_blockpools or disable_cephfs):
+        """
+        check by example:
+        cephfs-subvolumegroup-rados-ns: csi
+        csi-cephfs-node-ceph-user: cephfs-node-01780250-8de8-4b88-a5e8-fbbd05110986
+        csi-cephfs-provisioner-ceph-user: cephfs-provisioner-01780250-8de8-4b88-a5e8-fbbd05110986
+        csi-rbd-node-ceph-user: rbd-node-01780250-8de8-4b88-a5e8-fbbd05110986
+        csi-rbd-provisioner-ceph-user: rbd-provisioner-01780250-8de8-4b88-a5e8-fbbd05110986
+        csiop-cephfs-client-profile: openshift-storage
+        csiop-rbd-client-profile: openshift-storage
+        rbd-rados-ns: <implicit>
+
+        """
+        # basic check with static names
+        ceph_data_on_consumer_match["cephfs-subvolumegroup"] = (
+            ceph_data.get("cephfs-subvolumegroup", "") == "csi"
+        )
+        ceph_data_on_consumer_match["cephfs-subvolumegroup-rados-ns"] = (
+            ceph_data.get("cephfs-subvolumegroup-rados-ns", "") == "csi"
+        )
+        ceph_data_on_consumer_match["rbd-rados-ns"] = (
+            ceph_data.get("rbd-rados-ns", "") == "<implicit>"
+        )
+
+        _handle_converged_client_ceph_names(ceph_data, ceph_data_on_consumer_match)
+    elif (
+        not internal_consumer
+        and not (disable_blockpools or disable_cephfs)
+        and not is_cluster_y_version_upgraded()
+    ):
+        ceph_data_on_consumer_match["cephfs-subvolumegroup"] = (
+            ceph_data.get("cephfs-subvolumegroup", "") == f"{consumer_name}"
+        )
+        ceph_data_on_consumer_match["cephfs-subvolumegroup-rados-ns"] = (
+            ceph_data.get("cephfs-subvolumegroup-rados-ns", "") == f"{consumer_name}"
+        )
+        ceph_data_on_consumer_match["rbd-rados-ns"] = (
+            ceph_data.get("rbd-rados-ns", "") == f"{consumer_name}"
+        )
+
+        _handle_storageconsumer_ceph_client_names_fresh_converged(
+            ceph_data, ceph_data_on_consumer_match, storage_consumer_uid
+        )
+    # next elif block guarantees we are verifying external consumer on post-upgrade 4.19 cluster
+    # post-upgrade 4.20 must be same as a fresh 4.19 cluster
+    elif (
+        not internal_consumer
+        and not (disable_blockpools or disable_cephfs)
+        and is_cluster_y_version_upgraded()
+        and convergence_ver(config.ENV_DATA["ocs_version"])
+    ):
+        """
+        check by example:
+        cephfs-subvolumegroup: consumer-cl-418-c
+        cephfs-subvolumegroup-rados-ns: consumer-cl-418-c
+        csi-cephfs-node-ceph-user: cephfs-node-ffb707b4-855e-4e70-a7df-910e56a7b56c
+        csi-cephfs-provisioner-ceph-user: cephfs-provisioner-ffb707b4-855e-4e70-a7df-910e56a7b56c
+        csi-rbd-node-ceph-user: rbd-node-ffb707b4-855e-4e70-a7df-910e56a7b56c
+        csi-rbd-provisioner-ceph-user: rbd-provisioner-ffb707b4-855e-4e70-a7df-910e56a7b56c
+        csiop-cephfs-client-profile: ffb707b4-855e-4e70-a7df-910e56a7b56c
+        csiop-rbd-client-profile: ffb707b4-855e-4e70-a7df-910e56a7b56c
+        rbd-rados-ns: consumer-cl-418-c
+        """
+        ceph_data_on_consumer_match["cephfs-subvolumegroup"] = (
+            ceph_data.get("cephfs-subvolumegroup", "") == f"{consumer_name}"
+        )
+        ceph_data_on_consumer_match["cephfs-subvolumegroup-rados-ns"] = (
+            ceph_data.get("cephfs-subvolumegroup-rados-ns", "") == f"{consumer_name}"
+        )
+        ceph_data_on_consumer_match["rbd-rados-ns"] = (
+            ceph_data.get("rbd-rados-ns", "") == f"{consumer_name}"
+        )
+        _handle_storageconsumer_ceph_client_names_upgraded_converged(
+            ceph_data, ceph_data_on_consumer_match, storage_consumer_uid
+        )
+    else:
+        # mainly a placeholder, we should not reach this line
+        raise NotImplementedError(
+            "Unknown configuration for ceph data on consumer:\n"
+            f"is internal consumer: {internal_consumer}\n"
+            f"disabled blockpools: {disable_blockpools}\n"
+            f"disabled cephfs: {disable_cephfs}\n"
+            f"ODF_ver: {convergence_ver(config.ENV_DATA['ocs_version'])}"
+        )
+    return ceph_data_on_consumer_match
+
+
+def get_ready_storage_consumers():
+    """
+    Get a list of StorageConsumer objects that are in READY state.
+
+    Returns:
+        list[StorageConsumer]: List of StorageConsumer objects in READY state.
+
+    """
+    if config.ENV_DATA.get("cluster_type") == "provider":
+        cluster_index = config.get_provider_index()
+    else:
+        cluster_index = config.default_cluster_index
+
+    consumer_names = get_consumer_names()
+    ready_consumers = []
+
+    for consumer_name in consumer_names:
+        sc = StorageConsumer(
+            consumer_name,
+            config.ENV_DATA["cluster_namespace"],
+            cluster_index,
+        )
+        if sc.get_state() == constants.STATUS_READY:
+            ready_consumers.append(sc)
+        else:
+            log.warning(f"StorageConsumer {consumer_name} is not in READY state")
+
+    return ready_consumers
+
+
+def get_ready_consumers_names():
+    """
+    Get the names of all storage consumers that are in READY state.
+
+    Returns:
+        list: List of names of storage consumers in READY state.
+    """
+    ready_consumers = get_ready_storage_consumers()
+    return [consumer.name for consumer in ready_consumers]
+
+
+def check_consumer_rns(consumer_name, pool_list, rns_list):
+    """
+    Verify that the Rados namespaces on the consumer match the expected ones.
+    Each pool must have one RNS for each Storage Consumer.
+
+    Args:
+       consumer_name (str): Name of the storage consumer
+       pool_list (list): List of pool names
+       rns_list (list): List of Rados namespaces
+
+    Returns:
+       bool: True if RNS found for each consumer over all pools (excluding exception list), False otherwise.
+
+    """
+    log.info(f"Verifying Rados namespaces for consumer {consumer_name}")
+    excluded_pools = {"builtin-mgr", "ocs-storagecluster-cephnfs-builtin-pool"}
+    consumer_rns_valid = {}
+
+    for pool in pool_list:
+        if pool in excluded_pools:
+            continue
+        expected_rns_name = (
+            f"{pool}-builtin-implicit"
+            if consumer_name == "internal"
+            else f"{pool}-{consumer_name}"
+        )
+
+        if expected_rns_name in rns_list:
+            consumer_rns_valid[f"{consumer_name}/{pool}"] = True
+        else:
+            log.warning(f"No RNS found for pool {pool} and consumer {consumer_name}")
+            consumer_rns_valid[f"{consumer_name}/{pool}"] = False
+
+    log.info(f"Consumer RNS: {consumer_rns_valid}")
+    return all(consumer_rns_valid.values())
+
+
+@if_version(">4.18")
+def check_consumers_rns():
+    """
+    Verify that the Rados namespaces on the consumer match the expected ones.
+    Function is for all clusters that host ceph and are post-convergence.
+
+    Returns:
+        bool: True if RNS found for each consumer over all pools, False otherwise.
+
+    """
+    # we can not use 'current' cluster index, because it is more likely not a provider cluster than a 'default'
+    if config.ENV_DATA.get("cluster_type") == "provider":
+        cluster_index = config.get_provider_index()
+    else:
+        cluster_index = config.default_cluster_index
+
+    with config.RunWithConfigContext(cluster_index):
+        log.info(
+            f"Running RNS verification for consumers on cluster {config.cluster_ctx.ENV_DATA['cluster_name']}"
+        )
+        consumer_names = get_ready_consumers_names()
+        pool_names = fetch_pool_names()
+        rados_namespaces = fetch_rados_namespaces(config.ENV_DATA["cluster_namespace"])
+
+        for consumer_name in consumer_names:
+            log.info(f"Verifying Rados namespaces for consumer {consumer_name}")
+            if not check_consumer_rns(consumer_name, pool_names, rados_namespaces):
+                return False
+        log.info("All Rados namespaces verified successfully.")
+        return True
+
+
+def check_consumer_svg(consumer_name, volume_list, svg_list):
+    """
+    Verify that the subvolumegroup on the consumer matches the expected one.
+
+    Args:
+        consumer_name (str): Name of the storage consumer
+        volume_list (list): List of volume names
+        svg_list (list): List of subvolumegroup names
+
+    Returns:
+        bool: True if subvolumegroup found for each consumer, False otherwise.
+
+    """
+    log.info(f"Verifying subvolumegroup for consumer {consumer_name}")
+    consumer_svg_valid = {}
+    for volume in volume_list:
+        expected_svg_name = consumer_name if consumer_name != "internal" else "csi"
+
+        if expected_svg_name in svg_list:
+            consumer_svg_valid[f"{consumer_name}/{volume}"] = True
+        else:
+            log.warning(
+                f"No subvolumegroup found for volume {volume} and consumer {consumer_name}"
+            )
+            consumer_svg_valid[f"{consumer_name}/{volume}"] = False
+
+    log.info(f"Consumer subvolumegroup: {consumer_svg_valid}")
+    return all(consumer_svg_valid.values())
+
+
+@if_version(">4.18")
+def check_consumers_svg():
+    """
+    Verify that the subvolumegroup on the consumer matches the expected one.
+    Function is for all clusters that host ceph and are post-convergence.
+    Although only one volume/filesystem is currently supported, this function is designed to check
+    all volumes have svg dedicated for consumer.
+
+    Returns:
+        bool: True if subvolumegroup found for each consumer, False otherwise.
+
+    """
+    # we can not use 'current' cluster index, because it is more likely not a provider cluster than a 'default'
+    if config.ENV_DATA.get("cluster_type") == "provider":
+        cluster_index = config.get_provider_index()
+    else:
+        cluster_index = config.default_cluster_index
+
+    with config.RunWithConfigContext(cluster_index):
+        svg_names = get_cephfs_subvolumegroup_names()
+        filesystems = ocp.OCP(
+            kind=constants.CEPHFILESYSTEM,
+            namespace=config.ENV_DATA["cluster_namespace"],
+        ).get()
+        consumer_names = get_ready_consumers_names()
+        volume_names = [fs["metadata"]["name"] for fs in filesystems.get("items", [])]
+
+        for consumer_name in consumer_names:
+            log.info(f"Verifying subvolumegroup for consumer {consumer_name}")
+
+            if not check_consumer_svg(consumer_name, volume_names, svg_names):
+                log.error(
+                    f"Subvolumegroup verification failed for consumer {consumer_name}."
+                )
+                return False
+            else:
+                log.info(
+                    f"Subvolumegroup verified successfully for consumer {consumer_name}"
+                )
+
+        log.info("All subvolumegroup verified successfully.")
+        return True
+
+
+def check_storage_classes_on_clients(ready_consumer_names: list[str]):
+    """
+    Verify that the storage classes are distributed and available in the inventory of a hosted cluster.
+
+    Returns:
+        bool: True if the storage classes are distributed and available, False otherwise.
+
+    """
+    log.info(
+        "Verify Storage Classes are distributed and available in inventory of a hosted cluster"
+    )
+    from ocs_ci.deployment.hosted_cluster import get_autodistributed_storage_classes
+
+    with config.RunWithProviderConfigContextIfAvailable():
+
+        storage_classes_on_provider = get_autodistributed_storage_classes()
+        if not storage_classes_on_provider:
+            log.error(
+                "No storage classes found on the provider. Likely misconfiguration or ODF is not set up."
+            )
+            return False
+
+    def wait_storage_classes_equal(given_classes):
+        """
+        This function will fetch StorageClasses with current multicluster config
+
+        Args:
+            given_classes (list): List of expected storage classes to match against the provider's storage classes.
+
+        Returns:
+            bool: True if the storage classes match, False otherwise.
+
+        """
+        sample = TimeoutSampler(
+            timeout=300,
+            sleep=10,
+            func=lambda: set(given_classes)
+            == set(get_autodistributed_storage_classes()),
+        )
+        if not sample.wait_for_func_status(result=True):
+            res = False
+            log.error(
+                "The storage classes on the provider do not match the "
+                f"expected storage classes on {config.ENV_DATA['cluster_name']}."
+            )
+        else:
+            res = True
+            log.info(
+                "The storage classes on the provider match the "
+                f"expected storage classes on {config.ENV_DATA['cluster_name']}."
+            )
+        return res
+
+    with ThreadPoolExecutor() as executor:
+        futures = []
+        for multicluster_config_index in config.get_consumer_indexes_list():
+            log.info(
+                f"Checking multicluster config index '{multicluster_config_index}', if Consumer is Ready. "
+                "Skip verifying distribution of consumer which is intentionally or not NotReady"
+            )
+            cluster_name = config.get_cluster_name_by_index(multicluster_config_index)
+            # consumer names are built like '<consumer_name>-<cluster_name>'
+            if any([rcn for rcn in ready_consumer_names if rcn.endswith(cluster_name)]):
+                log.info(
+                    "Submitting task to verify storage classes with "
+                    f"client {config.get_cluster_name_by_index(multicluster_config_index)}"
+                )
+                futures.append(
+                    executor.submit(
+                        config_safe_thread_pool_task,
+                        multicluster_config_index,
+                        wait_storage_classes_equal,
+                        storage_classes_on_provider,
+                    )
+                )
+        results = []
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                result = future.result()
+                log.info(f"Future result: {result}")
+                results.append(result)
+            except Exception as e:
+                log.error(f"Error in future execution: {e}")
+
+        log.info(f"Results of storage classes verification across consumers: {results}")
+        return all(results)

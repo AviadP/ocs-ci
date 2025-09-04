@@ -313,16 +313,19 @@ class BucketNotificationsManager:
             resource_description="notif", resource_type="id"
         )
         notif_config = {
-            "TopicConfiguration": {
-                "Id": rand_id,
-                "Events": events,
-                "Topic": conn_config_path,
-            }
+            "TopicConfigurations": [
+                {
+                    "Id": rand_id,
+                    "Events": events,
+                    "TopicArn": conn_config_path,
+                }
+            ]
         }
         notif_config_json = json.dumps(notif_config).replace('"', '\\"')
         awscli_pod.exec_cmd_on_pod(
             command=craft_s3_command(
-                f"put-bucket-notification --bucket {bucket} --notification-configuration '{notif_config_json}'",
+                f"put-bucket-notification-configuration --bucket {bucket} "
+                f"--notification-configuration '{notif_config_json}'",
                 mcg_obj=mcg_obj,
                 api=True,
             )
@@ -351,7 +354,7 @@ class BucketNotificationsManager:
             )
         )
 
-    def get_events(self, topic, timeout_in_ms=10000):
+    def get_events(self, topic, timeout_in_ms=15000):
         """
         Query a Kafka topic for events
 
@@ -363,16 +366,29 @@ class BucketNotificationsManager:
             list: List of event dictionaries
         """
         # Query the Kafka topic via the Kafka consumer script on any of the Kafka pods
-        kafka_pod = Pod(
-            **get_pods_having_label(
+        kafka_pods = [
+            Pod(**pod_info)
+            for pod_info in get_pods_having_label(
                 namespace=constants.AMQ_NAMESPACE, label=constants.KAFKA_PODS_LABEL
-            )[0]
-        )
-        cmd = (
-            f"bin/kafka-console-consumer.sh --bootstrap-server {constants.KAFKA_ENDPOINT} "
-            f"--topic {topic} --from-beginning --timeout-ms {timeout_in_ms}"
-        )
-        raw_resp = kafka_pod.exec_cmd_on_pod(command=cmd, out_yaml_format=False)
+            )
+        ]
+        for kafka_pod in kafka_pods:
+            cmd = (
+                f"bin/kafka-console-consumer.sh --bootstrap-server {constants.KAFKA_ENDPOINT} "
+                f"--topic {topic} --from-beginning "
+                f"--max-messages 999999 "  # timeout-ms by itself might exit early
+                f"--timeout-ms {timeout_in_ms}"
+            )
+
+            # for some test involving node shutdown, we make sure we get the events
+            # from available kafka pods
+            try:
+                raw_resp = kafka_pod.exec_cmd_on_pod(command=cmd, out_yaml_format=False)
+            except CommandFailed as err:
+                if "connect: no route to host" in err.args[0]:
+                    continue
+                raise err
+            break
 
         # Parse the raw response into a list of event dictionaries
         events = []
@@ -384,6 +400,7 @@ class BucketNotificationsManager:
                 if isinstance(parsed_event, dict) and "Records" in parsed_event:
                     event_dict = parsed_event["Records"][0]
                     events.append(event_dict)
+        logger.info(events)
         return events
 
     def cleanup(self):

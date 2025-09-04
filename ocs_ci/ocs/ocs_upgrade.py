@@ -7,13 +7,14 @@ import time
 
 from selenium.webdriver.common.by import By
 from ocs_ci.framework import config
+from ocs_ci.framework.logger_helper import log_step
 from ocs_ci.helpers.helpers import verify_nb_db_psql_version
 from ocs_ci.deployment.deployment import (
     create_catalog_source,
     create_ocs_secret,
     Deployment,
-    get_and_apply_icsp_from_catalog,
 )
+from ocs_ci.utility.deployment import get_and_apply_idms_from_catalog
 from ocs_ci.deployment.disconnected import prepare_disconnected_ocs_deployment
 from ocs_ci.deployment.helpers.external_cluster_helpers import (
     ExternalCluster,
@@ -41,7 +42,10 @@ from ocs_ci.ocs.resources.csv import (
     get_csvs_start_with_prefix,
 )
 from ocs_ci.ocs.resources.install_plan import wait_for_install_plan_and_approve
-from ocs_ci.ocs.resources.pod import get_noobaa_pods, verify_pods_upgraded
+from ocs_ci.ocs.resources.pod import (
+    get_noobaa_pods,
+    verify_pods_upgraded,
+)
 from ocs_ci.ocs.resources.packagemanifest import (
     get_selector_for_ocs_operator,
     PackageManifest,
@@ -54,6 +58,7 @@ from ocs_ci.ocs.resources.storage_cluster import (
 from ocs_ci.ocs.utils import setup_ceph_toolbox, get_expected_nb_db_psql_version
 from ocs_ci.utility import version
 from ocs_ci.utility.reporting import update_live_must_gather_image
+from ocs_ci.utility.retry import retry
 from ocs_ci.utility.rgwutils import get_rgw_count
 from ocs_ci.utility.utils import (
     decode,
@@ -129,6 +134,96 @@ def get_upgrade_image_info(old_csv_images, new_csv_images):
     )
 
 
+@retry(ValueError, tries=20, delay=30, backoff=1)
+def get_expected_noobaa_pod_count(upgrade_version):
+    """
+    Verify if all the images of OCS objects got upgraded
+
+    Args:
+        upgrade_version (packaging.version.Version): version of OCS
+
+    Returns:
+        int: number of expected noobaa pods
+
+    """
+    expected_noobaa_pods = [
+        "noobaa-core-0",
+        "noobaa-operator",
+        "noobaa-db-pg-cluster-1",
+        "noobaa-db-pg-cluster-2",
+    ]
+
+    endpoint_count = 0
+    noobaa_pod_obj = get_noobaa_pods()
+    noobaa_pod_names = [pod.name for pod in noobaa_pod_obj]
+    logger.info(f"Current noobaa pods under validation: {noobaa_pod_names}")
+    for pod in noobaa_pod_obj:
+        if "pv-backingstore" in pod.name:
+            expected_noobaa_pods.append(pod.name)
+        if upgrade_version >= parse_version("4.19"):
+            if "noobaa-default-backing-store" in pod.name:
+                logger.info(
+                    "In some cases like MCG only or HCI we are counting noobaa-default-backing-store"
+                )
+                expected_noobaa_pods.append(pod.name)
+            if "cnpg-controller-manager" in pod.name:
+                expected_noobaa_pods.append(pod.name)
+        if "noobaa-endpoint" in pod.name:
+            endpoint_count += 1
+            expected_noobaa_pods.append(pod.name)
+
+    noobaa = OCP(kind="noobaa", namespace=config.ENV_DATA["cluster_namespace"])
+    resource = noobaa.get()["items"][0]
+    endpoints = resource.get("spec", {}).get("endpoints", {})
+    max_endpoints = endpoints.get("maxCount", constants.MAX_NB_ENDPOINT_COUNT)
+    min_endpoints = endpoints.get(
+        "minCount", constants.MIN_NB_ENDPOINT_COUNT_POST_DEPLOYMENT
+    )
+
+    if not (min_endpoints <= endpoint_count <= max_endpoints):
+        raise ValueError(
+            f"Endpoint pod count {endpoint_count} not in allowed range [{min_endpoints}, {max_endpoints}]"
+        )
+
+    if len(noobaa_pod_obj) != len(expected_noobaa_pods):
+        raise ValueError(
+            f"Expected noobaa pods: {expected_noobaa_pods} do not match actual noobaa pods: {noobaa_pod_names}"
+        )
+    return len(noobaa_pod_obj)
+
+
+@retry(Exception, tries=3, delay=60, backoff=1)
+def verify_noobaa_pods_upgraded(old_images, upgrade_version):
+    """
+    Verify noobaa pods are upgraded
+
+    Args:
+        old_images (set): set with old images
+        upgrade_version (packaging.version.Version): version of OCS
+
+    """
+    noobaa_pods = get_expected_noobaa_pod_count(upgrade_version)
+    noobaa_db_psql_version = get_expected_nb_db_psql_version()
+    ignore_psql_12_verification = (
+        int(noobaa_db_psql_version) != constants.NOOBAA_POSTGRES_12_VERSION
+    )
+
+    num_nodes = (
+        config.ENV_DATA["worker_replicas"]
+        + config.ENV_DATA["master_replicas"]
+        + config.ENV_DATA.get("infra_replicas", 0)
+    )
+    timeout = 600 if num_nodes < 6 else 900
+
+    verify_pods_upgraded(
+        old_images,
+        selector=constants.NOOBAA_APP_LABEL,
+        count=noobaa_pods,
+        timeout=timeout,
+        ignore_psql_12_verification=ignore_psql_12_verification,
+    )
+
+
 def verify_image_versions(old_images, upgrade_version, version_before_upgrade):
     """
     Verify if all the images of OCS objects got upgraded
@@ -141,73 +236,18 @@ def verify_image_versions(old_images, upgrade_version, version_before_upgrade):
     """
     number_of_worker_nodes = len(get_nodes())
     verify_pods_upgraded(old_images, selector=constants.OCS_OPERATOR_LABEL)
-    verify_pods_upgraded(old_images, selector=constants.OPERATOR_LABEL)
-    # Default noobaa pods
-    # noobaa-db-pg-cluster-1
-    # noobaa-db-pg-cluster-2
-    # noobaa-core-0
-    # noobaa-operator
-    default_noobaa_pods = 4
-    noobaa_pods = default_noobaa_pods
-    noobaa_pod_obj = get_noobaa_pods()
-    if (
+    if not (
         config.ENV_DATA.get("mcg_only_deployment")
-        and config.ENV_DATA["platform"].lower() == constants.VSPHERE_PLATFORM
+        and (
+            upgrade_version >= parse_version("4.20")
+            or (
+                version_before_upgrade == parse_version("4.19")
+                and upgrade_version == parse_version("4.19")
+            )
+        )
     ):
-        default_noobaa_pods = 4
-        if upgrade_version >= parse_version("4.19"):
-            # noobaa-default-backing-store-noobaa-pod
-            default_noobaa_pods = 5
-    if upgrade_version >= parse_version("4.19"):
-        log.info("Increased default noobaa pod count by 1 due to cnpg pod")
-        default_noobaa_pods += 1
-    for pod in noobaa_pod_obj:
-        if "pv-backingstore" in pod.name:
-            default_noobaa_pods += 1
-    if upgrade_version >= parse_version("4.7"):
-        noobaa = OCP(kind="noobaa", namespace=config.ENV_DATA["cluster_namespace"])
-        resource = noobaa.get()["items"][0]
-        endpoints = resource.get("spec", {}).get("endpoints", {})
-        max_endpoints = endpoints.get("maxCount", constants.MAX_NB_ENDPOINT_COUNT)
-        min_endpoints = endpoints.get(
-            "minCount", constants.MIN_NB_ENDPOINT_COUNT_POST_DEPLOYMENT
-        )
-        noobaa_pods = default_noobaa_pods + min_endpoints
-    noobaa_db_psql_version = get_expected_nb_db_psql_version()
-    ignore_psql_12_verification = True
-    if int(noobaa_db_psql_version) == constants.NOOBAA_POSTGRES_12_VERSION:
-        ignore_psql_12_verification = False
-    try:
-        num_nodes = (
-            config.ENV_DATA["worker_replicas"]
-            + config.ENV_DATA["master_replicas"]
-            + config.ENV_DATA.get("infra_replicas", 0)
-        )
-        upgrade_noobaa_timeout = 1620
-        if num_nodes >= 6:
-            upgrade_noobaa_timeout = 2220
-        verify_pods_upgraded(
-            old_images,
-            selector=constants.NOOBAA_APP_LABEL,
-            count=noobaa_pods,
-            timeout=upgrade_noobaa_timeout,
-            ignore_psql_12_verification=ignore_psql_12_verification,
-        )
-    except TimeoutException as ex:
-        if upgrade_version >= parse_version("4.7"):
-            log.info(
-                "Noobaa pods didn't match. Trying once more with max noobaa endpoints!"
-                f"Exception: {ex}"
-            )
-            noobaa_pods = default_noobaa_pods + max_endpoints
-            verify_pods_upgraded(
-                old_images,
-                selector=constants.NOOBAA_APP_LABEL,
-                count=noobaa_pods,
-                timeout=60,
-            )
-        else:
-            raise
+        verify_pods_upgraded(old_images, selector=constants.OPERATOR_LABEL)
+    verify_noobaa_pods_upgraded(old_images, upgrade_version)
     if not config.ENV_DATA.get("mcg_only_deployment"):
         odf_running_version = version.get_ocs_version_from_csv(only_major_minor=True)
         # cephfs and rbdplugin label and count
@@ -430,7 +470,6 @@ class OCSUpgrade(object):
         the actual csv
 
         """
-
         csv_name = None
         csv_list = get_csvs_start_with_prefix(resource_name, namespace=self.namespace)
         for csv in csv_list:
@@ -475,7 +514,7 @@ class OCSUpgrade(object):
             resource_name=resource_name,
             selector=operator_selector,
         )
-        package_manifest.wait_for_resource()
+        package_manifest.wait_for_resource(timeout=120)
         channel = config.DEPLOYMENT.get("ocs_csv_channel")
         if not channel:
             channel = package_manifest.get_default_channel()
@@ -494,11 +533,7 @@ class OCSUpgrade(object):
             subscription_name = constants.ODF_SUBSCRIPTION
         else:
             subscription_name = constants.OCS_SUBSCRIPTION
-        kind_name = (
-            "subscription.operators.coreos.com"
-            if config.multicluster
-            else "subscription"
-        )
+        kind_name = "subscription.operators.coreos.com"
         subscription = OCP(
             resource_name=subscription_name,
             kind=kind_name,
@@ -609,7 +644,24 @@ class OCSUpgrade(object):
             resource_name=constants.OPERATOR_CATALOG_SOURCE_NAME,
             namespace=constants.MARKETPLACE_NAMESPACE,
         )
-
+        stage_testing = config.DEPLOYMENT.get("stage_rh_osbs")
+        konflux_build = config.DEPLOYMENT.get("konflux_build")
+        if konflux_build and stage_testing:
+            log_step("Creating stage TagMirrorSet")
+            exec_cmd(f"oc apply -f {constants.STAGE_TAG_MIRROR_SET_YAML}")
+            log_step("Creating stage ImageDigestMirrorSet")
+            exec_cmd(f"oc apply -f {constants.STAGE_IMAGE_DIGEST_MIRROR_SET_YAML}")
+            log_step("Sleeping 60 seconds after applying tag mirror set.")
+            time.sleep(60)
+            log_step("Waiting max 30 mins for master MCP to get updated")
+            exec_cmd(
+                "oc wait --for=condition=Updated --timeout=30m mcp/master", timeout=2100
+            )
+            log_step("Waiting max 30 mins for worker MCP to get updated")
+            exec_cmd(
+                "oc wait --for=condition=Updated --timeout=30m mcp/worker", timeout=2100
+            )
+            return
         if not self.upgrade_in_current_source:
             disable_specific_source(constants.OPERATOR_CATALOG_SOURCE_NAME)
             if not ocs_catalog.is_exist():
@@ -639,7 +691,7 @@ class OCSUpgrade(object):
                 ocs_catalog.apply(cs_yaml.name)
                 if not config.DEPLOYMENT.get("disconnected"):
                     # on Disconnected cluster, ICSP from the ocs-registry image is not needed/valid
-                    get_and_apply_icsp_from_catalog(f"{image_url}:{new_image_tag}")
+                    get_and_apply_idms_from_catalog(f"{image_url}:{new_image_tag}")
 
 
 def run_ocs_upgrade(
@@ -923,7 +975,7 @@ def run_ocs_upgrade(
 
     if (
         platform in (constants.VSPHERE_PLATFORM, constants.IBMCLOUD_PLATFORM)
-        and upgrade_version_semantic >= version.VERSION_4_19
+        and upgrade_version_semantic >= version.VERSION_4_18
     ):
         # using try/except to not fail deployments since these values are good to have
         # for vsphere platform

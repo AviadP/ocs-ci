@@ -15,6 +15,7 @@ from ocs_ci.framework.pytest_customization.marks import (
     runs_on_provider,
     mcg,
     skipif_fips_enabled,
+    skipif_fips_enabled_on_ibm_cloud,
 )
 from ocs_ci.framework.testlib import (
     MCGTest,
@@ -128,7 +129,7 @@ class TestBucketIO(MCGTest):
                     "CLI",
                     {"interface": "CLI", "backingstore_dict": {"rgw": [(1, None)]}},
                 ],
-                marks=[tier1, on_prem_platform_required],
+                marks=[tier2, on_prem_platform_required],
             ),
             pytest.param(
                 *[
@@ -142,7 +143,7 @@ class TestBucketIO(MCGTest):
                     },
                 ],
                 marks=[
-                    tier1,
+                    tier2,
                     on_prem_platform_required,
                     jira("DFBUGS-1035", run=False),
                 ],
@@ -191,26 +192,26 @@ class TestBucketIO(MCGTest):
         argvalues=[
             pytest.param(
                 None,
-                marks=[tier1],
+                marks=[tier1, skipif_fips_enabled_on_ibm_cloud],
             ),
             pytest.param(
                 {
                     "interface": "OC",
                     "backingstore_dict": {"aws": [(1, "eu-central-1")]},
                 },
-                marks=[tier1],
+                marks=[tier2],
             ),
             pytest.param(
                 {"interface": "OC", "backingstore_dict": {"azure": [(1, None)]}},
-                marks=[tier1],
+                marks=[tier2],
             ),
             pytest.param(
                 {"interface": "OC", "backingstore_dict": {"gcp": [(1, None)]}},
-                marks=[tier1],
+                marks=[tier2],
             ),
             pytest.param(
                 {"interface": "CLI", "backingstore_dict": {"ibmcos": [(1, None)]}},
-                marks=[tier1, skipif_fips_enabled],
+                marks=[tier2, skipif_fips_enabled],
             ),
         ],
         ids=[
@@ -231,19 +232,6 @@ class TestBucketIO(MCGTest):
             awscli_pod_session (pod): A pod running the AWSCLI tools
             bucket_factory: Calling this fixture creates a new bucket(s)
         """
-
-        if (
-            config.ENV_DATA.get("fips") == "true"
-            and "ibmcos" in bucketclass_dict["backingstore_dict"]
-        ):
-            pytest.skip("Skipping test for IBM Cloud on FIPS enabled cluster")
-
-        if (
-            config.ENV_DATA.get("fips") == "true"
-            and bucketclass_dict is None
-            and config.ENV_DATA["platform"].lower() == "ibm_cloud"
-        ):
-            pytest.skip("Skipping test for IBM Cloud on FIPS enabled cluster")
 
         download_dir = AWSCLI_TEST_OBJ_DIR
         file_size = int(
@@ -268,7 +256,7 @@ class TestBucketIO(MCGTest):
         argvalues=[
             pytest.param(
                 None,
-                marks=[tier1],
+                marks=[tier1, skipif_fips_enabled_on_ibm_cloud],
             ),
             pytest.param(
                 {
@@ -283,11 +271,11 @@ class TestBucketIO(MCGTest):
             ),
             pytest.param(
                 {"interface": "OC", "backingstore_dict": {"gcp": [(1, None)]}},
-                marks=[tier1],
+                marks=[tier2],
             ),
             pytest.param(
                 {"interface": "OC", "backingstore_dict": {"ibmcos": [(1, None)]}},
-                marks=[tier1],
+                marks=[tier2, skipif_fips_enabled],
             ),
         ],
         ids=[
@@ -308,18 +296,6 @@ class TestBucketIO(MCGTest):
             awscli_pod_session (pod): A pod running the AWSCLI tools
             bucket_factory: Calling this fixture creates a new bucket(s)
         """
-        if (
-            config.ENV_DATA.get("fips") == "true"
-            and "ibmcos" in bucketclass_dict["backingstore_dict"]
-        ):
-            pytest.skip("Skipping test for IBM Cloud on FIPS enabled cluster")
-
-        if (
-            config.ENV_DATA.get("fips") == "true"
-            and bucketclass_dict is None
-            and config.ENV_DATA["platform"].lower() == "ibm_cloud"
-        ):
-            pytest.skip("Skipping test for IBM Cloud on FIPS enabled cluster")
 
         download_dir = AWSCLI_TEST_OBJ_DIR
         bucketname = bucket_factory(1, bucketclass=bucketclass_dict)[0].name

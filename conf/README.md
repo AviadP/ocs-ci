@@ -107,11 +107,14 @@ anywhere else.
 * `mirror_registry` - Hostname of the mirror registry
 * `mirror_registry_user` - Username for disconnected cluster mirror registry
 * `mirror_registry_password` - Password for disconnected cluster mirror registry
-* `opm_index_prune_binary_image` - Required only for IBM Power Systems and IBM Z images: Operator Registry base image with the tag that matches the target OpenShift Container Platform cluster major and minor
+* `opm_index_prune_binary_image` - Required only for IBM Power Systems and IBM Z images: Operator Registry base image with the tag that matches the target OpenShift Container Platform cluster major and
+*`cnv_latest_stable` - Deploy stable cnv build if provided else nightly cnv build will be installed
+minor
 * `deploy_mce`- Boolean, Deploy mce if True
 version.
   (for example: `registry.redhat.io/openshift4/ose-operator-registry:v4.9`)
   [doc](https://access.redhat.com/documentation/en-us/openshift_container_platform/4.9/html/operators/administrator-tasks#olm-pruning-index-image_olm-managing-custom-catalogs)
+* `mce_channel` - Channel to use for MCE deployment. It is propagated to the MCE operator subscription.
 * `min_noobaa_endpoints` - Sets minimum noobaa endpoints (Workaround for https://github.com/red-hat-storage/ocs-ci/issues/2861)
 * `host_network` - Enable host network in the storage cluster CR and prepare rules needed in AWS for host network during OCP deployment
 * `subscription_plan_approval` - 'Manual' or 'Automatic' subscription approval for OCS upgrade
@@ -173,6 +176,10 @@ version.
 * `fdf_image_tag`: FDF image tag, used to retrieve fdf_pre_release_image_digest.
 * `fdf_pre_release_registry`: Registry where the pre-release image of FDF is hosted.
 * `fdf_pre_release_image_digest`: sha256 of the pre-release image of FDF to deploy.
+* `storage_cluster_override` - Dictionary with data which will allow you to dynamically override data in storageCluster CR.
+* `konflux_build` - Set to True if build is made by Konflux build system.
+* `enable_nested_virtualization` - Enable nested virtualization for vSphere platform primarily. Used for kubevirt on HCP Clusters. It sets options kvm_intel nested=1 options kvm_amd nested=1 in MachineConfig
+* `host_network` - Enable host network in the storage cluster CR and to be able to connect to the storage cluster from the host network or other scenarios where host network is required.
 
 #### REPORTING
 
@@ -191,6 +198,7 @@ Reporting related config. (Do not store secret data in the repository!).
 * `ocs_must_gather_latest_tag` - Latest tag to use for OCS must-gather
 * `gather_on_deploy_failure` - Run must-gather on deployment failure or not (Default: true)
 * `collect_logs_on_success_run` - Run must-gather on successful run or not (Default: false)
+* `dont_fail_on_collect_logs` - Don't fail in teardown when collection of logs on success run failed.
 * `must_gather_timeout` - Time (in seconds) to wait before timing out during must-gather
 * `post_upgrade` - If True, post-upgrade will be reported in the test suite
   name in the mail subject.
@@ -355,6 +363,7 @@ higher priority).
       * `hosted_odf_version` - version of ODF to be deployed on hosted clusters
       * `cp_availability_policy` - "HighlyAvailable" or "SingleReplica"; if not provided the default value is "SingleReplica"
       * `storage_quota` - storage quota for the hosted cluster
+      * `provider_cluster_name` - Name of the provider cluster if storageclient is required/present in the hosted cluster. This is optional and useful when there are more than one provider cluster in the config, provider mode RDR for example
 * `wait_timeout_for_healthy_osd_in_minutes` - timeout waiting for healthy OSDs before continuing upgrade (see https://bugzilla.redhat.com/show_bug.cgi?id=2276694 for more details)
 * `osd_maintenance_timeout` - is a duration in minutes that determines how long an entire failureDomain like region/zone/host will be held in noout
 * `odf_provider_mode_deployment` - True if you would like to enable provider mode deployment.
@@ -390,6 +399,9 @@ Upgrade related configuration data.
 * `upgrade_acm_version` - ACM version to which we have to upgrade
 * `upgrade_acm_registry_image` - ACM Image tag from brew which should be used to upgrade
 example: <brew_registry_url>/rh-osbs/iib:565330
+* `upgrade_cnv_version` - cnv version to which we have to upgrade
+* `upgrade_metallb_version` - metallb version to which we have to upgrade
+* `upgrade_lso_version` - lso version to which want to upgrade
 
 #### AUTH
 

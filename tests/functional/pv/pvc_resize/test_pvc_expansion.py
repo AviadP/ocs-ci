@@ -4,11 +4,16 @@ from concurrent.futures import ThreadPoolExecutor
 
 from ocs_ci.ocs import constants
 from ocs_ci.utility.utils import TimeoutSampler
-from ocs_ci.framework.pytest_customization.marks import green_squad, provider_mode
+from ocs_ci.framework.pytest_customization.marks import (
+    green_squad,
+    provider_mode,
+    run_on_all_clients_push_missing_configs,
+)
 from ocs_ci.framework.testlib import (
     skipif_ocs_version,
     ManageTest,
     tier1,
+    tier2,
     acceptance,
     skipif_upgraded_from,
 )
@@ -19,7 +24,6 @@ log = logging.getLogger(__name__)
 
 
 @green_squad
-@tier1
 @skipif_ocs_version("<4.5")
 @skipif_upgraded_from(["4.4"])
 class TestPvcExpand(ManageTest):
@@ -47,7 +51,7 @@ class TestPvcExpand(ManageTest):
             access_modes=access_modes_cephfs,
             status=constants.STATUS_BOUND,
             num_of_pvc=2,
-            timeout=90,
+            timeout=300,
         )
 
         self.pvcs_rbd = multi_pvc_factory(
@@ -57,7 +61,7 @@ class TestPvcExpand(ManageTest):
             access_modes=access_modes_rbd,
             status=constants.STATUS_BOUND,
             num_of_pvc=3,
-            timeout=90,
+            timeout=300,
         )
 
         pods_cephfs = helpers.create_pods(
@@ -147,7 +151,7 @@ class TestPvcExpand(ManageTest):
 
             # Split file size and write from two pods if access mode is RWX
             size = (
-                f"{int(file_size/2)}G"
+                f"{int(file_size / 2)}G"
                 if (pod_obj.pvc.access_mode == constants.ACCESS_MODE_RWX)
                 else f"{file_size}G"
             )
@@ -177,8 +181,10 @@ class TestPvcExpand(ManageTest):
 
     @provider_mode
     @acceptance
+    @run_on_all_clients_push_missing_configs
+    @tier1
     @pytest.mark.polarion_id("OCS-2219")
-    def test_pvc_expansion(self):
+    def test_pvc_expansion(self, cluster_index):
         """
         Verify PVC expand feature
 
@@ -194,6 +200,7 @@ class TestPvcExpand(ManageTest):
         log.info(f"Expanding PVCs to {pvc_size_new}G")
         self.expand_and_verify(pvc_size_new)
 
+    @tier2
     @pytest.mark.polarion_id("OCS-302")
     def test_pvc_expand_expanded_pvc(self):
         """

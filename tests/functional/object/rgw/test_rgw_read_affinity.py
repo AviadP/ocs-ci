@@ -49,13 +49,13 @@ class TestRGWReadAffinityMode:
             sample = TimeoutSampler(
                 timeout=60,
                 sleep=10,
-                func=self.get_read_affinity_from_ceph,
+                func=self.get_rgw_read_affinity_from_ceph,
             )
             sample.wait_for_func_value(DEFAULT_READ_AFFINITY)
 
         request.addfinalizer(teardown)
 
-    def get_read_affinity_from_ceph(self):
+    def get_rgw_read_affinity_from_ceph(self):
         """
         Returns current readAffinity set in ceph cluster
         Returns :
@@ -100,7 +100,7 @@ class TestRGWReadAffinityMode:
         sample = TimeoutSampler(
             timeout=60,
             sleep=10,
-            func=self.get_read_affinity_from_ceph,
+            func=self.get_rgw_read_affinity_from_ceph,
         )
         sample.wait_for_func_value(DEFAULT_READ_AFFINITY)
 
@@ -130,6 +130,6 @@ class TestRGWReadAffinityMode:
             sample = TimeoutSampler(
                 timeout=60,
                 sleep=10,
-                func=self.get_read_affinity_from_ceph,
+                func=self.get_rgw_read_affinity_from_ceph,
             )
             sample.wait_for_func_value(val)
