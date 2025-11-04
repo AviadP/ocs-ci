@@ -15,7 +15,8 @@ import string
 import subprocess
 import time
 import traceback
-from typing import Match, Iterator
+from dataclasses import dataclass
+from typing import Match, Iterator, Callable, Any, TypeVar, Generic
 import stat
 import shutil
 from copy import deepcopy
@@ -1455,7 +1456,33 @@ def delete_dir(dir_name):
         log.error(f"Failed to delete the directory {dir_name}. Error: {e.strerror}")
 
 
-class TimeoutSampler(object):
+# Define TypeVar for generic TimeoutSampler
+T = TypeVar("T")
+
+
+@dataclass
+class RetryContext:
+    """
+    Context information passed to retry callbacks.
+
+    Attributes:
+        attempt_number (int): Current attempt number (1-indexed).
+        elapsed_time (float): Time elapsed since first attempt in seconds.
+        time_remaining (float): Time remaining before timeout in seconds.
+        exception (Exception | None): Exception raised by function, if any.
+        result (Any): Result returned by function, if successful.
+        func_name (str): Name of the function being retried.
+    """
+
+    attempt_number: int
+    elapsed_time: float
+    time_remaining: float
+    exception: Exception | None = None
+    result: Any = None
+    func_name: str = ""
+
+
+class TimeoutSampler(Generic[T]):
     """
     Samples the function output.
 
@@ -1476,7 +1503,18 @@ class TimeoutSampler(object):
         func_kwargs: Keyword arguments for the function
     """
 
-    def __init__(self, timeout, sleep, func, *func_args, **func_kwargs):
+    def __init__(
+        self,
+        timeout: int | float,
+        sleep: int | float,
+        func: Callable[..., T],
+        *func_args: Any,
+        reraise: bool = False,
+        on_attempt: Callable[[RetryContext], None] | None = None,
+        on_exception: Callable[[RetryContext], None] | None = None,
+        on_timeout: Callable[[RetryContext], None] | None = None,
+        **func_kwargs: Any,
+    ) -> None:
         self.timeout = timeout
         self.sleep = sleep
         # check that given timeout and sleep values makes sense
@@ -1487,13 +1525,20 @@ class TimeoutSampler(object):
         self.func_args = func_args
         self.func_kwargs = func_kwargs
 
-        # Timestamps of the first and most recent samples
-        self.start_time = None
-        self.last_sample_time = None
+        # Callback parameters
+        self.reraise = reraise
+        self.on_attempt = on_attempt
+        self.on_exception = on_exception
+        self.on_timeout = on_timeout
+
+        # Timestamp of the first sample
+        self.start_time: float | None = None
+        # Track if currently iterating (for reset safety)
+        self._is_iterating: bool = False
         # The exception to raise
         self.timeout_exc_cls = TimeoutExpiredError
         # Arguments that will be passed to the exception
-        self.timeout_exc_args = [self.timeout]
+        self.timeout_exc_args: list = [self.timeout]
         try:
             self.timeout_exc_args.append(
                 f"Timed out after {timeout}s running {self._build_call_string()}"
@@ -1503,8 +1548,8 @@ class TimeoutSampler(object):
                 "Failed to assemble call string. Not necessarily a test failure."
             )
 
-    def _build_call_string(self):
-        def stringify(value):
+    def _build_call_string(self) -> str:
+        def stringify(value: Any) -> str:
             if isinstance(value, str):
                 return f'"{value}"'
             return str(value)
@@ -1514,52 +1559,149 @@ class TimeoutSampler(object):
         all_args_string = ", ".join(args + kwargs)
         return f"{self.func.__name__}({all_args_string})"
 
-    def __iter__(self):
-        if self.start_time is None:
-            self.start_time = time.time()
-        while True:
-            self.last_sample_time = time.time()
-            if self.timeout <= (self.last_sample_time - self.start_time):
-                raise self.timeout_exc_cls(*self.timeout_exc_args)
-            try:
-                yield self.func(*self.func_args, **self.func_kwargs)
-            except Exception as ex:
-                msg = f"Exception raised during iteration: {ex}"
-                log.exception(msg)
-            if self.timeout <= (time.time() - self.start_time):
-                raise self.timeout_exc_cls(*self.timeout_exc_args)
-            log.info("Going to sleep for %d seconds before next iteration", self.sleep)
-            time.sleep(self.sleep)
+    def _safe_callback(
+        self,
+        callback: Callable[[RetryContext], None] | None,
+        attempt_num: int,
+        exception: Exception | None = None,
+        result: T | None = None,
+    ) -> None:
+        """
+        Safely invoke callback, catching any exceptions it raises.
 
-    def wait_for_func_value(self, value):
+        Args:
+            callback: Optional callback function to invoke.
+            attempt_num: Current attempt number.
+            exception: Exception if in error context.
+            result: Result if in success context.
+        """
+        if not callback:
+            return
+
+        try:
+            context = RetryContext(
+                attempt_number=attempt_num,
+                elapsed_time=time.time() - self.start_time if self.start_time else 0,
+                time_remaining=max(
+                    0,
+                    (
+                        self.timeout - (time.time() - self.start_time)
+                        if self.start_time
+                        else self.timeout
+                    ),
+                ),
+                exception=exception,
+                result=result,
+                func_name=getattr(self.func, "__name__", str(self.func)),
+            )
+            callback(context)
+        except Exception as callback_ex:
+            log.warning(
+                f"Callback {callback.__name__} raised {type(callback_ex).__name__}: {callback_ex}. "
+                "Continuing iteration."
+            )
+
+    def __iter__(self) -> Iterator[T]:
+        self._is_iterating = True
+        try:
+            if self.start_time is None:
+                self.start_time = time.time()
+
+            attempt_num = 0
+            while True:
+                # Single timeout check at loop start
+                elapsed = time.time() - self.start_time
+                if elapsed >= self.timeout:
+                    self._safe_callback(self.on_timeout, attempt_num)
+                    raise self.timeout_exc_cls(*self.timeout_exc_args)
+
+                attempt_num += 1
+
+                # Execute function
+                try:
+                    result = self.func(*self.func_args, **self.func_kwargs)
+                    self._safe_callback(self.on_attempt, attempt_num, result=result)
+                    yield result
+
+                except (KeyboardInterrupt, SystemExit):
+                    # Never catch system exceptions - re-raise immediately
+                    raise
+
+                except Exception as ex:
+                    # Handle callback first (with protection)
+                    self._safe_callback(self.on_exception, attempt_num, exception=ex)
+
+                    # Early return pattern - re-raise immediately if requested
+                    if self.reraise:
+                        raise
+
+                    # Reduced logging - only log at debug unless final attempt approaching
+                    if time.time() - self.start_time >= self.timeout - self.sleep:
+                        log.warning(
+                            f"Attempt {attempt_num} failed with {type(ex).__name__}: {ex}"
+                        )
+                    else:
+                        log.debug(
+                            f"Attempt {attempt_num} raised {type(ex).__name__}: {ex}"
+                        )
+
+                # Sleep only if there's time remaining
+                elapsed = time.time() - self.start_time
+                if elapsed + self.sleep < self.timeout:
+                    log.info(
+                        "Going to sleep for %d seconds before next iteration",
+                        self.sleep,
+                    )
+                    time.sleep(self.sleep)
+                # Loop will check timeout at next iteration start
+        finally:
+            self._is_iterating = False
+
+    def wait_for_func_value(self, value: T, raise_on_timeout: bool = True) -> bool:
         """
         Implements common usecase of TimeoutSampler: waiting until func (given
         function) returns a given value.
 
         Args:
             value: Expected return value of func we are waiting for.
+            raise_on_timeout: If True, raise on timeout. If False, return False.
+
+        Returns:
+            bool: True if value matched, False if timeout (when raise_on_timeout=False).
+
+        Raises:
+            TimeoutExpiredError: When timeout exceeded (if raise_on_timeout=True).
         """
         try:
             for i_value in self:
                 if i_value == value:
-                    break
+                    return True
         except self.timeout_exc_cls:
-            log.error(
-                "function %s failed to return expected value %s "
-                "after multiple retries during %d second timeout",
-                self.func.__name__,
-                value,
-                self.timeout,
-            )
-            raise
+            if raise_on_timeout:
+                log.error(
+                    "function %s failed to return expected value %s "
+                    "after multiple retries during %d second timeout",
+                    self.func.__name__,
+                    value,
+                    self.timeout,
+                )
+                raise
+            return False
+        return True
 
-    def wait_for_func_status(self, result):
+    def wait_for_func_status(
+        self, result: bool, raise_on_timeout: bool = False
+    ) -> bool:
         """
         Get function and run it for given time until success or timeout.
         (using __iter__ function)
 
         Args:
             result (bool): Expected result from func.
+            raise_on_timeout: If True, raise on timeout. If False, return False (default).
+
+        Returns:
+            bool: True if result matched, False if timeout.
 
         Examples::
 
@@ -1571,11 +1713,48 @@ class TimeoutSampler(object):
                 raise Exception
 
         """
-        try:
-            self.wait_for_func_value(result)
-            return True
-        except self.timeout_exc_cls:
-            return False
+        return self.wait_for_func_value(result, raise_on_timeout=raise_on_timeout)
+
+    def reset(self) -> None:
+        """
+        Reset sampler for reuse. Clears start_time and iteration state.
+
+        WARNING: NOT safe to call during active iteration.
+        Create a new TimeoutSampler instance instead if currently iterating.
+
+        Raises:
+            RuntimeError: If called while iteration is in progress.
+
+        Example:
+            sampler = TimeoutSampler(60, 5, check_health)
+            for status in sampler:
+                if status == "healthy":
+                    break
+
+            # Now can reset and reuse
+            sampler.reset()
+            for status in sampler:
+                ...
+        """
+        if self._is_iterating:
+            raise RuntimeError(
+                "Cannot reset TimeoutSampler while iteration is in progress. "
+                "Create a new instance instead."
+            )
+
+        self.start_time = None
+
+    @property
+    def time_remaining(self) -> float:
+        """
+        Time remaining before timeout (in seconds).
+
+        Returns:
+            float: Seconds remaining, or timeout value if not started. Returns 0 if timeout reached.
+        """
+        if self.start_time is None:
+            return self.timeout
+        return max(0, self.timeout - (time.time() - self.start_time))
 
 
 class TimeoutIterator(TimeoutSampler):
