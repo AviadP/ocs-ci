@@ -276,6 +276,8 @@ class MultiClusterConfig:
         provider_index = None
         if provider_name:
             provider_index = self.get_cluster_index_by_name(cluster_name=provider_name)
+        elif config.ENV_DATA.get("cluster_type") == "provider":
+            provider_index = config.cur_index
         else:
             for i, cluster in enumerate(self.clusters):
                 if cluster.ENV_DATA["cluster_type"] == "provider":
@@ -298,7 +300,7 @@ class MultiClusterConfig:
                 provider_indexes_list.append(cluster_index)
         return provider_indexes_list
 
-    def get_consumer_indexes_list(self):
+    def get_consumer_indexes_list(self, raise_exception=True):
         """
         Get the consumer cluster indexes
 
@@ -318,7 +320,7 @@ class MultiClusterConfig:
             ]:
                 consumer_indexes_list.append(i)
 
-        if not consumer_indexes_list:
+        if (not consumer_indexes_list) and raise_exception:
             raise ClusterNotFoundException("Didn't find any consumer cluster")
 
         return consumer_indexes_list
@@ -502,6 +504,28 @@ class MultiClusterConfig:
         self.switch_ctx(
             self.get_cluster_type_indices_list(cluster_type)[num_of_cluster]
         )
+
+    def run_for_all_clusters(self, func):
+        """
+        A decorator to run the decorated function for all clusters
+        and switch context between them.
+        """
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            prev_ctx = self.cur_index
+            try:
+                for cluster_index in range(self.nclusters):
+                    self.switch_ctx(cluster_index)
+                    logger.info(
+                        f"Running '{func.__name__}' for cluster {cluster_index}"
+                    )
+                    func(*args, **kwargs)
+            finally:
+                self.switch_ctx(prev_ctx)
+                logger.info(f"Restored ctx back to {prev_ctx}")
+
+        return wrapper
 
     class RunWithConfigContext(object):
         def __init__(self, config_index):

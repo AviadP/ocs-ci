@@ -43,6 +43,7 @@ from ocs_ci.ocs.utils import (
 from ocs_ci.ocs import constants, defaults, node, ocp, exceptions
 from ocs_ci.ocs.exceptions import (
     CommandFailed,
+    NoRunningCephToolBoxException,
     ResourceNotFoundError,
     ResourceWrongStatusException,
     TimeoutExpiredError,
@@ -54,8 +55,10 @@ from ocs_ci.ocs.resources import pod, pvc
 from ocs_ci.ocs.resources.ocs import OCS
 from ocs_ci.utility import templating, version
 from ocs_ci.utility.vsphere import VSPHERE
+from ocs_ci.utility.operators import NMStateOperator
 from ocs_ci.utility.retry import retry
 from ocs_ci.utility.utils import (
+    ceph_health_check,
     TimeoutSampler,
     ocsci_log_path,
     run_cmd,
@@ -107,6 +110,25 @@ def create_resource(do_reload=True, **kwargs):
     resource_name = kwargs.get("metadata").get("name")
     created_resource = ocs_obj.create(do_reload=do_reload)
     assert created_resource, f"Failed to create resource {resource_name}"
+    return ocs_obj
+
+
+def apply_resource(**kwargs):
+    """
+    Apply a resource. Safe for both create and update operations.
+
+    Args:
+        kwargs (dict): Dictionary of the OCS resource
+
+    Returns:
+        OCS: An OCS instance
+
+    Raises:
+        AssertionError: In case of any failure
+    """
+    ocs_obj = OCS(**kwargs)
+    kwargs.get("metadata").get("name")
+    ocs_obj.apply(**kwargs)
     return ocs_obj
 
 
@@ -309,7 +331,7 @@ def create_pod(
         pod_dict = pod_dict_path if pod_dict_path else constants.CSI_CEPHFS_POD_YAML
         interface = constants.CEPHFS_INTERFACE
     if deployment:
-        pod_dict = pod_dict_path if pod_dict_path else constants.FEDORA_DC_YAML
+        pod_dict = pod_dict_path if pod_dict_path else constants.FEDORA_DEPLOY_YAML
     pod_data = templating.load_yaml(pod_dict)
     if not pod_name:
         pod_name = create_unique_resource_name(f"test-{interface}", "pod")
@@ -318,6 +340,11 @@ def create_pod(
     if deployment:
         pod_data["metadata"]["labels"]["app"] = pod_name
         pod_data["spec"]["template"]["metadata"]["labels"]["name"] = pod_name
+        # Ensure selector field exists (defensive check for custom pod_dict_path)
+        if "selector" not in pod_data["spec"]:
+            pod_data["spec"]["selector"] = {}
+        if "matchLabels" not in pod_data["spec"]["selector"]:
+            pod_data["spec"]["selector"]["matchLabels"] = {}
         pod_data["spec"]["selector"]["matchLabels"]["name"] = pod_name
         pod_data["spec"]["replicas"] = replica_count
     if pvc_name:
@@ -461,9 +488,43 @@ def create_pod(
         logger.info(deployment_obj.name)
         deployment_name = deployment_obj.name
         label = f"name={deployment_name}"
+
+        # Determine how many pods to wait for based on PVC access mode and replica count
+        wait_resource_count = None
+        if pvc_name and replica_count > 1:
+            try:
+                # Get PVC object to check access mode
+                pvc_obj = pvc.PVC(name=pvc_name, namespace=namespace)
+                pvc_obj.reload()
+                pvc_access_mode = pvc_obj.get_pvc_access_mode
+
+                # For RWO volumes with multiple replicas, only one pod can be Running
+                # For RWX volumes, all replicas can be Running, so wait for all
+                if pvc_access_mode == constants.ACCESS_MODE_RWO:
+                    wait_resource_count = 1
+                    logger.info(
+                        f"PVC {pvc_name} has RWO access mode with {replica_count} replicas. "
+                        f"Waiting for 1 pod to be Running."
+                    )
+                # For RWX or other access modes, wait for all replicas (resource_count=None)
+                else:
+                    logger.info(
+                        f"PVC {pvc_name} has {pvc_access_mode} access mode with {replica_count} replicas. "
+                        f"Waiting for all pods to be Running."
+                    )
+            except Exception as ex:
+                # If we can't determine access mode, default to waiting for 1 pod
+                # to avoid timeout issues with RWO volumes
+                logger.warning(
+                    f"Could not determine PVC access mode for {pvc_name}: {ex}. "
+                    f"Defaulting to wait for 1 pod."
+                )
+                wait_resource_count = 1
+
         assert (ocp.OCP(kind="pod", namespace=namespace)).wait_for_resource(
             condition=constants.STATUS_RUNNING,
             selector=label,
+            resource_count=wait_resource_count,
             timeout=360,
             sleep=3,
         )
@@ -656,8 +717,8 @@ def create_ceph_file_system(cephfs_name=None, label=None, namespace=None):
 
 
 @retry(
-    CommandFailed,
-    tries=6,
+    (CommandFailed, IndexError),
+    tries=20,
     delay=30,
     backoff=1,
 )
@@ -2320,7 +2381,7 @@ def remove_scc_policy(sa_name, namespace):
         logger.info(out)
 
 
-def craft_s3_command(cmd, mcg_obj=None, api=False):
+def craft_s3_command(cmd, mcg_obj=None, api=False, max_attempts=8):
     """
     Crafts the AWS CLI S3 command including the
     login credentials and command to be ran
@@ -2329,6 +2390,9 @@ def craft_s3_command(cmd, mcg_obj=None, api=False):
         mcg_obj: An MCG object containing the MCG S3 connection credentials
         cmd: The AWSCLI command to run
         api: True if the call is for s3api, false if s3
+        max_attempts: The maximum number of AWSCLI retry attempts
+                     max_attempts=8 means a maximum of one minute
+                     additional waiting time in case of failure
 
     Returns:
         str: The crafted command, ready to be executed on the pod
@@ -2340,6 +2404,7 @@ def craft_s3_command(cmd, mcg_obj=None, api=False):
             f'sh -c "AWS_CA_BUNDLE={constants.SERVICE_CA_CRT_AWSCLI_PATH} '
             f"AWS_ACCESS_KEY_ID={mcg_obj.access_key_id} "
             f"AWS_SECRET_ACCESS_KEY={mcg_obj.access_key} "
+            f"AWS_MAX_ATTEMPTS={max_attempts} "
             f"AWS_DEFAULT_REGION={mcg_obj.region} "
             f"aws s3{api} "
             f"--endpoint={mcg_obj.s3_internal_endpoint} "
@@ -2832,6 +2897,60 @@ def wait_for_ct_pod_recovery():
     return True
 
 
+def ceph_health_check_with_toolbox_recovery(
+    namespace: str,
+    tries: int = 20,
+    delay: int = 30,
+    fix_ceph_health: bool = True,
+    update_jira: bool = True,
+    no_exception_if_jira_issue_updated: bool = False,
+) -> bool:
+    """
+    Perform ceph health check with automatic toolbox pod recovery.
+
+    If the ceph toolbox pod is not running (e.g., after node disruption tests),
+    this function will wait for the toolbox pod to recover before retrying.
+
+    Args:
+        namespace (str): Kubernetes namespace for ceph cluster.
+        tries (int): Number of retries for health check.
+        delay (int): Delay between retries in seconds.
+        fix_ceph_health (bool): Whether to attempt fixing ceph health issues.
+        update_jira (bool): Whether to update Jira on health issues.
+        no_exception_if_jira_issue_updated (bool): Skip exception if Jira was updated.
+
+    Returns:
+        bool: True if ceph health check passes.
+
+    Raises:
+        NoRunningCephToolBoxException: If toolbox pod doesn't recover.
+        CephHealthException: If ceph health check fails after retries.
+    """
+    try:
+        return ceph_health_check(
+            namespace=namespace,
+            tries=tries,
+            delay=delay,
+            fix_ceph_health=fix_ceph_health,
+            update_jira=update_jira,
+            no_exception_if_jira_issue_updated=no_exception_if_jira_issue_updated,
+        )
+    except NoRunningCephToolBoxException:
+        logger.warning(
+            "Ceph toolbox pod not running. Waiting for recovery before retry..."
+        )
+        if wait_for_ct_pod_recovery():
+            return ceph_health_check(
+                namespace=namespace,
+                tries=tries,
+                delay=delay,
+                fix_ceph_health=fix_ceph_health,
+                update_jira=update_jira,
+                no_exception_if_jira_issue_updated=no_exception_if_jira_issue_updated,
+            )
+        raise
+
+
 def label_worker_node(node_list, label_key, label_value):
     """
     Function to label worker node for running app pods on specific worker nodes.
@@ -3129,10 +3248,12 @@ def validate_pods_are_running_and_not_restarted(pod_name, pod_restart_count, nam
     )
     pod_state = pod_obj.get("status").get("phase")
     if pod_state == "Running" and restart_count == pod_restart_count:
-        logger.info("Pod is running state and restart count matches with previous one")
+        logger.info(
+            f"{pod_name} is running state and restart count matches with previous one"
+        )
         return True
     logger.error(
-        f"Pod is in {pod_state} state and restart count of pod {restart_count}"
+        f"{pod_name} is in {pod_state} state and restart count of pod {restart_count}"
     )
     logger.info(f"{pod_obj}")
     return False
@@ -3350,6 +3471,138 @@ def wait_for_pv_delete(pv_objs, timeout=180):
             wait_for_resource_state(pv_obj, constants.STATUS_RELEASED)
             pv_obj.delete()
         pv_obj.ocp.wait_for_delete(resource_name=pv_obj.name, timeout=timeout)
+
+
+def is_pvc_encrypted(pvc_obj):
+    """
+    Check if a PVC is encrypted by examining its StorageClass and PV attributes.
+
+    Args:
+        pvc_obj (PVC): PVC object to check
+
+    Returns:
+        bool: True if PVC is encrypted, False otherwise
+
+    """
+    try:
+        # Check 1: PV CSI volumeAttributes for encryption flag
+        pv_obj = pvc_obj.backed_pv_obj
+        if pv_obj:
+            pv_data = pv_obj.get()
+            csi_data = pv_data.get("spec", {}).get("csi", {})
+            volume_attributes = csi_data.get("volumeAttributes", {})
+
+            # Check if encrypted attribute is set to true
+            if volume_attributes.get("encrypted") == "true":
+                return True
+
+            # Check if encryptionKMSID is present (indicates encryption)
+            if volume_attributes.get("encryptionKMSID"):
+                return True
+
+        # Check 2: StorageClass parameters
+        if hasattr(pvc_obj, "storageclass") and pvc_obj.storageclass:
+            sc_data = pvc_obj.storageclass.get()
+            parameters = sc_data.get("parameters", {})
+
+            # Check if encrypted parameter is set
+            if parameters.get("encrypted") == "true":
+                return True
+
+            # Check if encryptionKMSID parameter is present
+            if parameters.get("encryptionKMSID"):
+                return True
+
+        return False
+
+    except Exception as e:
+        # If we can't determine encryption status, assume not encrypted
+        # to avoid unnecessary delays
+        logger.debug(
+            f"Could not determine encryption status for PVC {pvc_obj.name}: {e}"
+        )
+        return False
+
+
+def wait_for_volume_detachment(pvc_objs, timeout=180):
+    """
+    Wait until the volumes are fully detached from all nodes by checking the VolumeAttachment resources.
+    This makes sure the volumes are safely removed before deleting.
+
+    Args:
+        pvc_objs (list): List of PVC objects to check for detachment
+        timeout (int): Timeout in seconds to wait for detachment (default: 180)
+
+    Returns:
+        bool: True if all volumes are detached, False otherwise
+
+    """
+    logger.info(
+        f"Waiting for {len(pvc_objs)} volumes to detach from nodes (timeout: {timeout}s)"
+    )
+
+    # Get PV names from PVCs
+    pv_names = [pvc_obj.backed_pv_obj.name for pvc_obj in pvc_objs]
+
+    def check_volumes_detached():
+        """
+        Check if all volumes are detached by querying VolumeAttachment resources.
+
+        Returns:
+            bool: True if all volumes are detached, False otherwise
+
+        """
+        try:
+            # Query VolumeAttachment resources (cluster-scoped)
+            va_ocp = OCP(kind="VolumeAttachment", namespace="")
+            attachments = va_ocp.get()
+
+            # If no items key or empty list, all volumes are detached
+            if not attachments or "items" not in attachments:
+                logger.info("No VolumeAttachment resources found - volumes detached")
+                return True
+
+            # Check if any of our PVs are still attached
+            attached_pvs = []
+            for va in attachments.get("items", []):
+                pv_name = (
+                    va.get("spec", {}).get("source", {}).get("persistentVolumeName", "")
+                )
+                if pv_name in pv_names:
+                    attached_pvs.append(pv_name)
+
+            if attached_pvs:
+                logger.debug(
+                    f"Still waiting for {len(attached_pvs)} volume(s) to detach: "
+                    f"{attached_pvs}"
+                )
+                return False
+
+            logger.info("All volumes successfully detached from nodes")
+            return True
+
+        except CommandFailed as e:
+            # If the API call fails with NotFound, it means no VolumeAttachments exist
+            if "NotFound" in str(e):
+                logger.info("No VolumeAttachment resources found - volumes detached")
+                return True
+            # For other errors, log warning but continue checking
+            logger.warning(f"Error checking VolumeAttachment: {e}")
+            return False
+
+    # Use TimeoutSampler to poll until volumes are detached
+    try:
+        for detached in TimeoutSampler(
+            timeout=timeout, sleep=5, func=check_volumes_detached
+        ):
+            if detached:
+                return True
+    except Exception as e:
+        logger.warning(
+            f"Timeout waiting for volume detachment after {timeout}s: {e}. "
+            "Proceeding anyway."
+        )
+        return False
 
 
 @retry(UnexpectedBehaviour, tries=40, delay=10, backoff=1)
@@ -4423,7 +4676,7 @@ def get_noobaa_db_used_space():
 
     """
     noobaa_db_pod_obj = pod.get_noobaa_pods(
-        noobaa_label=constants.NOOBAA_DB_LABEL_47_AND_ABOVE
+        noobaa_label=constants.NOOBAA_DB_LABEL_419_AND_ABOVE
     )
     cmd_out = noobaa_db_pod_obj[0].exec_cmd_on_pod(
         command="df -h /var/lib/pgsql/", out_yaml_format=False
@@ -4495,6 +4748,92 @@ def verify_quota_resource_exist(quota_name):
     return quota_name in [
         quota_resource.get("metadata").get("name") for quota_resource in quota_resources
     ]
+
+
+def verify_substrings_in_string(output_string, expected_strings):
+    """
+    Verify all expected substrings are present in the output string
+
+    Args:
+        output_string (str): String to check
+        expected_strings (list): Expected substrings
+
+    Returns:
+        bool: True if all expected strings found, False otherwise
+
+    """
+    for expected_string in expected_strings:
+        if expected_string not in output_string:
+            logger.error(f"Expected string: {expected_string} not in {output_string}")
+            return False
+    return True
+
+
+def wait_for_quota_usage_update(
+    clusterresourcequota_obj,
+    quota_name,
+    quota_key,
+    expected_strings,
+    operation_description,
+    timeout=120,
+):
+    """
+    Wait for ClusterResourceQuota usage to update and verify expected strings
+
+    Args:
+        clusterresourcequota_obj (obj): ClusterResourceQuota OCP object
+        quota_name (str): Name of the quota resource
+        quota_key (str): Quota key to check (e.g., 'requests.storage')
+        expected_strings (list): Strings to verify (e.g., ['8Gi', '7Gi'])
+        operation_description (str): Operation description for logging
+        timeout (int): Timeout in seconds (default: 120)
+
+    Raises:
+        TimeoutExpiredError: If quota usage doesn't update within timeout
+
+    """
+    logger.info(f"Waiting for quota usage to reflect {operation_description}")
+    sample = TimeoutSampler(
+        timeout=timeout,
+        sleep=5,
+        func=clusterresourcequota_obj.get,
+        resource_name=quota_name,
+    )
+    for quota_resource in sample:
+        # Extract used and hard quota values from the resource
+        try:
+            used = quota_resource.get("status", {}).get("total", {}).get("used", {})
+            hard = quota_resource.get("spec", {}).get("quota", {}).get("hard", {})
+
+            # Get storage request values using the specified quota key
+            used_storage = used.get(quota_key, "0")
+            hard_storage = hard.get(quota_key, "0")
+
+            logger.info(
+                f"Quota usage for {quota_name}: "
+                f"used={used_storage}, hard={hard_storage}"
+            )
+
+            # Check if the expected values are present
+            quota_info = f"{used_storage} {hard_storage}"
+            if verify_substrings_in_string(
+                output_string=quota_info,
+                expected_strings=expected_strings,
+            ):
+                logger.info(
+                    f"Quota usage updated successfully after {operation_description}"
+                )
+                return
+        except (KeyError, AttributeError) as e:
+            logger.warning(f"Failed to parse quota resource: {e}")
+            continue
+    else:
+        err_str = (
+            f"Quota usage did not update to show {expected_strings} after {timeout} seconds "
+            f"for {operation_description}."
+        )
+        logger.error(err_str)
+        raise TimeoutExpiredError(err_str)
 
 
 def check_cluster_is_compact():
@@ -4762,8 +5101,9 @@ def verify_log_exist_in_pods_logs(
             container=container,
             all_containers=all_containers_flag,
             since=since,
+            grep=expected_log,
+            return_empty_string=True,
         )
-        logger.info(f"logs osd:{pod_logs}")
         if expected_log in pod_logs:
             return True
     return False
@@ -4908,16 +5248,16 @@ def odf_cli_set_log_level(service, log_level, subsystem):
     """
     from pathlib import Path
 
-    if not (Path(config.RUN["bin_dir"]) / "odf-cli").exists():
+    if not (Path(config.RUN["bin_dir"]) / "odf").exists():
         retrieve_cli_binary(cli_type="odf")
 
     logger.info(
         f"Setting ceph log level for {service} on {subsystem} to {log_level} using odf-cli tool."
     )
-    cmd = f"odf-cli set ceph log-level {service} {subsystem} {log_level}"
+    cmd = f"odf set ceph log-level {service} {subsystem} {log_level}"
 
     logger.info(cmd)
-    return exec_cmd(cmd, use_shell=True)
+    return exec_cmd(cmd, shell=True)
 
 
 def get_ceph_log_level(service, subsystem):
@@ -5324,11 +5664,10 @@ def upgrade_multus_holder_design():
         return
     if config.ENV_DATA.get("multus_create_public_net"):
         add_route_public_nad()
-        from ocs_ci.deployment.nmstate import NMStateInstaller
-
-        logger.info("Install NMState operator and create an instance")
-        nmstate_obj = NMStateInstaller()
-        nmstate_obj.running_nmstate()
+        nmstate_operator = NMStateOperator(
+            create_catalog=True,
+        )
+        nmstate_operator.deploy()
         configure_node_network_configuration_policy_on_all_worker_nodes()
     reset_all_osd_pods()
     enable_csi_disable_holder_pods()
@@ -5629,6 +5968,7 @@ def update_volsync_channel():
             )
 
 
+@retry(CommandFailed, tries=30, delay=10, backoff=1)
 def verify_nb_db_psql_version(check_image_name_version=True):
     """
     Verify that the NooBaa DB PostgreSQL version matches the expectation
@@ -5862,10 +6202,31 @@ def remove_toleration():
         namespace=config.ENV_DATA["cluster_namespace"],
         kind=constants.STORAGECLUSTER,
     )
-    params = '[{"op": "remove", "path": "/spec/placement"}]'
-    result = storagecluster_obj.patch(params=params, format_type="json")
-    if not result:
-        logger.error("Failed to remove toleration from storagecluster")
+    try:
+        # Check if placement exists before trying to remove it
+        storagecluster_data = storagecluster_obj.get()
+        if "placement" in storagecluster_data.get("spec", {}):
+            params = '[{"op": "remove", "path": "/spec/placement"}]'
+            result = storagecluster_obj.patch(params=params, format_type="json")
+            if not result:
+                logger.error("Failed to remove toleration from storagecluster")
+                success = False
+            else:
+                logger.info(
+                    "Successfully removed placement section from storagecluster"
+                )
+        else:
+            logger.info(
+                "No placement section found in storagecluster, skipping removal"
+            )
+    except CommandFailed as e:
+        logger.warning(
+            f"Failed to remove placement from storagecluster: {e}. "
+            "This may be expected if placement was not previously set."
+        )
+        # Avoided to mark as failure since this might be expected
+    except Exception as e:
+        logger.error(f"Unexpected error removing placement from storagecluster: {e}")
         success = False
     logger.info("Remove tolerations from subscriptions")
 
@@ -5891,20 +6252,56 @@ def remove_toleration():
         )
         driver_list = ocp.get_all_resource_names_of_a_kind(kind=constants.DRIVER)
         for driver_name in driver_list:
-            params = (
-                '[{"op": "remove", "path": "/spec/controllerPlugin/tolerations"},'
-                '{"op": "remove", "path": "/spec/nodePlugin/tolerations"}]'
-            )
-            result = driver_obj.patch(
-                resource_name=driver_name, params=params, format_type="json"
-            )
-            if result:
-                logger.info(
-                    f"Successfully removed tolerations from CSI driver {driver_name}"
+            try:
+                # Check if tolerations exist before attempt to remove toleration
+                driver_data = driver_obj.get(resource_name=driver_name)
+                spec = driver_data.get("spec", {})
+                controller_plugin = spec.get("controllerPlugin") or {}
+                node_plugin = spec.get("nodePlugin") or {}
+
+                # Build patch command if paths exist
+                params = []
+                if (
+                    isinstance(controller_plugin, dict)
+                    and "tolerations" in controller_plugin
+                ):
+                    params.append(
+                        {"op": "remove", "path": "/spec/controllerPlugin/tolerations"}
+                    )
+                if isinstance(node_plugin, dict) and "tolerations" in node_plugin:
+                    params.append(
+                        {"op": "remove", "path": "/spec/nodePlugin/tolerations"}
+                    )
+
+                if params:
+                    result = driver_obj.patch(
+                        resource_name=driver_name,
+                        params=json.dumps(params),
+                        format_type="json",
+                    )
+                    if result:
+                        logger.info(
+                            f"Successfully removed tolerations from CSI driver {driver_name}"
+                        )
+                    else:
+                        logger.error(
+                            f"Failed to remove tolerations from CSI driver {driver_name}"
+                        )
+                        success = False
+                else:
+                    logger.info(
+                        f"No tolerations found in CSI driver {driver_name}, skipping removal"
+                    )
+            except CommandFailed as e:
+                # Handle case where patch fails (e.g., path doesn't exist)
+                logger.warning(
+                    f"Failed to remove tolerations from CSI driver {driver_name}: {e}. "
+                    "This may be expected if tolerations were not previously added."
                 )
-            else:
+                # Don't mark as failure since this might be expected in negative test cases
+            except Exception as e:
                 logger.error(
-                    f"Failed to remove tolerations from CSI driver {driver_name}"
+                    f"Unexpected error while removing tolerations from CSI driver {driver_name}: {e}"
                 )
                 success = False
 
@@ -5987,6 +6384,83 @@ def change_reclaimspacecronjob_state_for_pvc(pvc_objs, suspend=True):
         cron_obj.patch(params=suspend_patch, format_type="json")
 
     return True
+
+
+def set_schedule_precedence(precedence):
+    """
+    Create or update the 'csi-addons-config' ConfigMap with the given
+    schedule-precedence ('storageclass' or 'pvc') and restart the CSI Addons
+    controller manager so the change is picked up.
+
+    Handles both cases: ConfigMap exists / does not exist.
+    Uses valid JSON for merge patch to avoid decoding errors.
+    """
+    import yaml
+
+    if precedence not in ("storageclass", "pvc"):
+        raise ValueError(
+            f"Invalid precedence value: {precedence}. Must be 'storageclass' or 'pvc'."
+        )
+
+    configmap_name = getattr(
+        constants, "CSI_ADDONS_CONFIGMAP_NAME", "csi-addons-config"
+    )
+    namespace = config.ENV_DATA.get("cluster_namespace", "openshift-storage")
+
+    cm_ocp = OCP(kind=constants.CONFIGMAP, namespace=namespace)
+
+    # Manifest used when CM does not exist
+    cm_manifest = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": configmap_name, "namespace": namespace},
+        "data": {"schedule-precedence": precedence},
+    }
+
+    if cm_ocp.is_exist(configmap_name):
+        # UPDATE PATH: use valid JSON for merge patch (K8s expects JSON here)
+        patch_payload = json.dumps({"data": {"schedule-precedence": precedence}})
+        logger.info(
+            "Patching ConfigMap '%s' in ns '%s' to schedule-precedence=%s",
+            configmap_name,
+            namespace,
+            precedence,
+        )
+        # NOTE: wrap JSON in single quotes so shlex keeps it as one arg
+        cm_ocp.exec_oc_cmd(
+            f"patch configmap {configmap_name} -p '{patch_payload}' --type=merge",
+            out_yaml_format=False,
+        )
+    else:
+        # CREATE PATH: write manifest to temp file and apply
+        logger.info(
+            "Creating ConfigMap '%s' in ns '%s' with schedule-precedence=%s",
+            configmap_name,
+            namespace,
+            precedence,
+        )
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".yaml") as fp:
+            yaml.safe_dump(cm_manifest, fp, sort_keys=False)
+            tmp_path = fp.name
+        try:
+            cm_ocp.exec_oc_cmd(f"apply -f {tmp_path}", out_yaml_format=False)
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    logger.info(
+        "ConfigMap '%s' set to schedule-precedence=%s", configmap_name, precedence
+    )
+
+    # Restart CSI Addons controller manager pods so the new value is read
+    logger.info("Restarting CSI Addons controller manager pods...")
+    pod.restart_pods_having_label(
+        label=constants.CSI_ADDONS_CONTROLLER_MANAGER_LABEL,
+        namespace=namespace,
+    )
+    logger.info("CSI Addons controller manager pods restarted.")
 
 
 def verify_reclaimspacecronjob_suspend_state_for_pvc(pvc_obj):
@@ -6316,7 +6790,7 @@ def get_rbd_daemonset_csi_addons_node_object(node):
     namespace = config.ENV_DATA["cluster_namespace"]
     csi_addons_node = OCP(kind=constants.CSI_ADDONS_NODE_KIND, namespace=namespace)
     csi_addons_node_data = csi_addons_node.get(
-        resource_name=f"{node}-{namespace}-daemonset-openshift-storage.rbd.csi.ceph.com-nodeplugin"
+        resource_name=f"{node}-{namespace}-daemonset-openshift-storage.rbd.csi.ceph.com-nodeplugin-csi-addons"
     )
     return csi_addons_node_data
 
@@ -6546,3 +7020,148 @@ def get_node_plugin_label(interface):
         elif interface == constants.CEPHBLOCKPOOL:
             label = constants.CSI_RBDPLUGIN_LABEL
     return label
+
+
+def get_schedule_precedance_value_from_csi_addons_configmap(
+    default="storageclass",
+):
+    """
+    Return the schedule precedence from the 'csi-addons-config' ConfigMap.
+
+    If the ConfigMap (or key) doesn't exist, return the default ('storageclass').
+
+    The ConfigMap has the following structure:
+    - name: csi-addons-config
+    - namespace: openshift-storage (or cluster_namespace)
+    - data.schedule-precedence: 'storageclass' or 'pvc'
+
+    Args:
+        default (str): Default value to return if ConfigMap doesn't exist.
+                        Defaults to 'storageclass'.
+
+    Returns:
+        str: The schedule precedence value ('storageclass' or 'pvc').
+    """
+    cm_name = getattr(constants, "CSI_ADDONS_CONFIGMAP_NAME", "csi-addons-config")
+    namespace = config.ENV_DATA.get("cluster_namespace", "openshift-storage")
+
+    cm_ocp = OCP(kind=constants.CONFIGMAP, namespace=namespace)
+
+    try:
+        if not cm_ocp.is_exist(cm_name):
+            logger.info(
+                "ConfigMap '%s' not found in namespace '%s'; using default '%s'.",
+                cm_name,
+                namespace,
+                default,
+            )
+            return default
+
+        cm = cm_ocp.get(resource_name=cm_name)
+        value = cm.get("data", {}).get("schedule-precedence", "").strip().lower()
+
+        if value in ("storageclass", "pvc"):
+            logger.info("Schedule precedence from ConfigMap: %s", value)
+            return value
+
+        logger.warning(
+            "ConfigMap '%s' has missing/invalid 'schedule-precedence' (got '%s'); using default '%s'.",
+            cm_name,
+            value,
+            default,
+        )
+        return default
+
+    except CommandFailed as e:
+        logger.warning(
+            "Failed to read ConfigMap '%s' in ns '%s' (%s); using default '%s'.",
+            cm_name,
+            namespace,
+            e,
+            default,
+        )
+        return default
+
+
+def verify_socket_on_node(node_name, host_path, socket_name):
+    """
+    Verify the existence of socket at host path on node.
+
+    Args:
+        node_name (str): The name of specific node
+        host_path (str): The host path where socket exist
+        socket_name (str): The name of socket file
+
+    Returns:
+        bool: True if the socket file exist at host path on given node.
+
+    """
+    ocp = OCP(kind="node")
+    debug_node_output = ocp.exec_oc_debug_cmd(
+        node=node_name, cmd_list=[f"ls -l {host_path}/{socket_name}"]
+    )
+    return socket_name in debug_node_output
+
+
+def set_rook_log_level():
+    """
+    Set the rook log level
+    """
+    rook_log_level = config.DEPLOYMENT.get("rook_log_level")
+    if rook_log_level:
+        set_configmap_log_level_rook_ceph_operator(rook_log_level)
+
+
+def check_osds_down(osd_ids: list[str]) -> bool:
+    """
+    Check if specified OSDs are marked as 'down' in Ceph
+
+    Args:
+        osd_ids (list[str]): List of OSD IDs to check
+
+    Returns:
+        bool: True if all OSDs are down, False otherwise
+    """
+    log = logging.getLogger(__name__)
+    ceph_pod = pod.get_ceph_tools_pod()
+    osd_dump = ceph_pod.exec_ceph_cmd("ceph osd dump")
+
+    osds_status = {}
+    for osd in osd_dump["osds"]:
+        osd_id = str(osd["osd"])
+        if osd_id in osd_ids:
+            osds_status[osd_id] = {"up": osd["up"], "in": osd["in"]}
+
+    for osd_id, status in osds_status.items():
+        state = "up" if status["up"] == 1 else "down"
+        log.info(f"OSD {osd_id}: {state}")
+
+    all_down = all(status["up"] == 0 for status in osds_status.values())
+    return all_down
+
+
+def wait_for_osds_down(osd_ids: list[str], timeout: int = 300, sleep: int = 10) -> None:
+    """
+    Wait for OSDs to be marked as 'down' in Ceph using polling
+
+    Args:
+        osd_ids (list[str]): List of OSD IDs to wait for
+        timeout (int): Timeout in seconds (default: 300)
+        sleep (int): Sleep interval between checks (default: 10)
+
+    Raises:
+        TimeoutExpiredError: If OSDs don't go down within timeout
+    """
+    log = logging.getLogger(__name__)
+    log.info(f"Waiting for OSDs {osd_ids} to be marked as 'down' in Ceph")
+
+    sample = TimeoutSampler(
+        timeout=timeout, sleep=sleep, func=check_osds_down, osd_ids=osd_ids
+    )
+
+    if not sample.wait_for_func_status(result=True):
+        raise TimeoutExpiredError(
+            f"OSDs {osd_ids} did not go down within {timeout} seconds"
+        )
+
+    log.info(f"All OSDs {osd_ids} are now marked as 'down'")

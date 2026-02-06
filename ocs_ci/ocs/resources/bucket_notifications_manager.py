@@ -332,7 +332,7 @@ class BucketNotificationsManager:
         )
         if wait:
             logger.info("Waiting for put-bucket-notification to propagate")
-            sleep(60)
+            sleep(90)
 
     def get_bucket_notification_configuration(self, awscli_pod, mcg_obj, bucket):
         """
@@ -401,6 +401,10 @@ class BucketNotificationsManager:
                     event_dict = parsed_event["Records"][0]
                     events.append(event_dict)
         logger.info(events)
+
+        # Filter out the irrelevant TestEvent which helps NooBaa check the connection
+        events = [event for event in events if "TestEvent" not in str(event)]
+
         return events
 
     def cleanup(self):

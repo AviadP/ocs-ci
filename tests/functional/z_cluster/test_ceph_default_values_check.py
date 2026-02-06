@@ -180,6 +180,13 @@ class TestCephDefaultValuesCheck(ManageTest):
         log.info(f"OCS version is {ocs_version}")
         log.info(f"Expected config values: {expected_config}")
 
+        # Ignore mon_warn_on_pool_no_redundancy - leftover from failed replica-1 cleanup
+        if (
+            "global" in ceph_config
+            and "mon_warn_on_pool_no_redundancy" in ceph_config["global"]
+        ):
+            ceph_config["global"].pop("mon_warn_on_pool_no_redundancy")
+
         # Direct dictionary comparison
         assert ceph_config == expected_config, (
             f"The Ceph config in CephCluster spec.cephConfig "
@@ -263,38 +270,45 @@ class TestCephDefaultValuesCheck(ManageTest):
     @post_ocs_upgrade
     @pytest.mark.polarion_id("OCS-2739")
     @skipif_managed_service
-    @skipif_ocs_version("<4.9")
+    @skipif_ocs_version(["<4.9", ">=4.19"])
     @tier2
     def test_noobaa_postgres_cm_post_ocs_upgrade(self):
         """
-        Validate noobaa postgres configmap post OCS upgrade
+        Important: Postgres configmap is replaced with CNPG in 4.19.
+        Skip the test for ocs >= 4.19.
 
+        Validate noobaa postgres configmap post OCS upgrade.
         """
         cm_obj = OCP(
             kind=constants.CONFIGMAP,
             resource_name=constants.NOOBAA_POSTGRES_CONFIGMAP,
             namespace=config.ENV_DATA["cluster_namespace"],
         )
+
         config_data = cm_obj.get().get("data").get("noobaa-postgres.conf")
-        config_data = config_data.split("\n")
-        config_data = config_data[5:]
+        config_data = config_data.split("\n")[5:]
+
         log.info(
-            "Validating that the values configured in noobaa-postgres configmap "
-            "match the ones stored in ocs-ci"
+            "Validating that the values configured in noobaa-postgres "
+            "configmap match the ones stored in ocs-ci"
         )
+
         ocs_version = version.get_semantic_ocs_version_from_config()
-        log.info(f"ocs version----{ocs_version}")
+        log.info("OCS version: %s", ocs_version)
+
         if ocs_version <= version.VERSION_4_8:
             stored_values = constants.NOOBAA_POSTGRES_TUNING_VALUES.split("\n")
-            stored_values.remove("")
-        elif ocs_version >= version.VERSION_4_9:
+        else:
             stored_values = constants.NOOBAA_POSTGRES_TUNING_VALUES_4_9.split("\n")
-            stored_values.remove("")
+
+        stored_values = [value for value in stored_values if value]
+
         assert collections.Counter(config_data) == collections.Counter(stored_values), (
             f"The config set in {constants.NOOBAA_POSTGRES_CONFIGMAP} "
-            f"is different than the expected. Please inform OCS-QE about this discrepancy. "
-            f"The expected values are:\n{stored_values}\n"
-            f"The cluster's existing values are:{config_data}"
+            "is different than expected. Please inform OCS-QE about this "
+            "discrepancy.\n"
+            f"Expected values:\n{stored_values}\n"
+            f"Cluster values:\n{config_data}"
         )
 
     @post_ocs_upgrade

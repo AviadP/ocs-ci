@@ -9,14 +9,28 @@ import tempfile
 
 import yaml
 
+from ocs_ci.deployment.helpers import storage_class
+from ocs_ci.deployment.helpers.lso_helpers import add_disks_lso
 from ocs_ci.deployment.helpers.storage_class import get_storageclass
 from ocs_ci.framework import config
+
+from ocs_ci.helpers.helpers import create_lvs_resource
 from ocs_ci.ocs import constants, defaults, node
 from ocs_ci.ocs.exceptions import CommandFailed
 from ocs_ci.ocs.ocp import OCP
-from ocs_ci.utility import templating
+from ocs_ci.utility import templating, version
 from ocs_ci.utility.retry import retry
 from ocs_ci.utility.utils import run_cmd
+
+from ocs_ci.ocs.resources.storage_cluster import StorageCluster
+from ocs_ci.utility.storage_cluster_setup import StorageClusterSetup
+from ocs_ci.utility.operators import LocalStorageOperator
+
+import time
+from ocs_ci.utility.utils import (
+    wait_for_machineconfigpool_status,
+    get_running_ocp_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,37 +39,78 @@ class FusionDataFoundationDeployment:
     def __init__(self):
         self.pre_release = config.DEPLOYMENT.get("fdf_pre_release", False)
         self.kubeconfig = config.RUN["kubeconfig"]
+        self.lso_enabled = config.DEPLOYMENT.get("local_storage", False)
+        self.fdf_skip_storage_setup = config.DEPLOYMENT.get(
+            "fdf_skip_storage_setup", False
+        )
+        storage_class.set_custom_storage_class_path()
+
+    @property
+    def storage_class(self):
+        if not config.ENV_DATA.get("storage_class"):
+            sc = storage_class.get_storageclass() or constants.DEFAULT_STORAGECLASS_LSO
+            self.storage_class = sc
+            return sc
+        return config.ENV_DATA["storage_class"]
+
+    @storage_class.setter
+    def storage_class(self, value):
+        config.ENV_DATA["storage_class"] = value
+
+    @property
+    def custom_storage_class_path(self):
+        return config.ENV_DATA["custom_storage_class_path"]
 
     def deploy(self):
         """
         Installs IBM Fusion Data Foundation.
         """
+
+        self.ensure_lso_installed()
         logger.info("Installing IBM Fusion Data Foundation")
         if self.pre_release:
             self.create_image_tag_mirror_set()
             self.create_image_digest_mirror_set()
             self.setup_fdf_pre_release_deployment()
+
         self.create_fdf_service_cr()
         self.verify_fdf_installation()
-        self.setup_storage()
+        if not self.fdf_skip_storage_setup:
+            self.setup_storage()
+
+    def ensure_lso_installed(self):
+        """
+        In the case of LSO is not available - bring catalog for unreleased version and install it
+        """
+
+        logger.info("Ensuring Local Storage Operator (LSO) is installed")
+        lso_operator = LocalStorageOperator()
+        if not lso_operator.is_available():
+            lso_operator.create_catalog()
+            lso_operator.deploy()
 
     def create_image_tag_mirror_set(self):
         """
-        Create ImageTagMirrorSet.
+        Create or update ImageTagMirrorSet.
         """
-        logger.info("Creating FDF ImageTagMirrorSet")
+        logger.info("Creating or Updating FDF ImageTagMirrorSet")
+
+        imagetag_file = constants.FDF_IMAGE_TAG_MIRROR_SET
+
         run_cmd(
-            f"oc --kubeconfig {self.kubeconfig} create -f {constants.FDF_IMAGE_TAG_MIRROR_SET}"
+            f"oc --kubeconfig {self.kubeconfig} apply -f {imagetag_file}", silent=True
         )
 
     def create_image_digest_mirror_set(self):
         """
-        Create ImageDigestMirrorSet.
+        Create or update ImageTagMirrorSet.
         """
         logger.info("Creating FDF ImageDigestMirrorSet")
         image_digest_mirror_set = extract_image_digest_mirror_set()
+
         run_cmd(
-            f"oc --kubeconfig {self.kubeconfig} create -f {image_digest_mirror_set}"
+            f"oc --kubeconfig {self.kubeconfig} apply -f {image_digest_mirror_set}",
+            silent=True,
         )
         os.remove(image_digest_mirror_set)
 
@@ -65,13 +120,17 @@ class FusionDataFoundationDeployment:
         """
         logger.info("Creating FDF service CR")
         run_cmd(
-            f"oc --kubeconfig {self.kubeconfig} create -f {constants.FDF_SERVICE_CR}"
+            f"oc --kubeconfig {self.kubeconfig} apply -f {constants.FDF_SERVICE_CR}",
+            silent=True,
         )
 
     def setup_fdf_pre_release_deployment(self):
         """
         Perform steps to prepare for a Pre-release deployment of FDF.
         """
+        time.sleep(60)
+        wait_for_machineconfigpool_status(node_type="all")
+
         fdf_image_tag = config.DEPLOYMENT.get("fdf_image_tag")
         fdf_catalog_name = defaults.FUSION_CATALOG_NAME
         fdf_registry = config.DEPLOYMENT.get("fdf_pre_release_registry")
@@ -86,13 +145,15 @@ class FusionDataFoundationDeployment:
             logger.info(f"Retrieved image digest: {fdf_image_digest}")
             config.DEPLOYMENT["fdf_pre_release_image_digest"] = fdf_image_digest
 
+        ocp_version = f"ocp{get_running_ocp_version().replace('.', '')}-t"
+        logger.info(f"OCP version: {ocp_version}")
         logger.info("Updating FusionServiceDefinition")
         params_dict = {
             "spec": {
                 "onboarding": {
                     "serviceOperatorSubscription": {
                         "multiVersionCatSrcDetails": {
-                            "ocp418-t": {
+                            ocp_version: {
                                 "imageDigest": fdf_image_digest,
                                 "registryPath": fdf_registry,
                             }
@@ -114,6 +175,7 @@ class FusionDataFoundationDeployment:
         """
         logger.info("Verifying FDF installation")
         fusion_service_instance_health_check()
+        wait_for_storageclusters_crd()
         self.get_installed_version()
         logger.info("FDF successfully installed")
 
@@ -141,8 +203,25 @@ class FusionDataFoundationDeployment:
         """
         logger.info("Configuring storage.")
         self.patch_catalogsource()
-        self.create_odfcluster()
-        odfcluster_status_check()
+
+        fusion_version = config.ENV_DATA["fusion_version"].replace("v", "")
+        fusion_version = version.get_semantic_version(fusion_version, True)
+
+        # Storage configuration method changed in Fusion 2.11
+        if fusion_version < version.VERSION_2_11:
+            self.create_odfcluster()
+            odfcluster_status_check()
+        else:
+            logger.info("Storage configuration for Fusion 2.11 or greater")
+            if self.lso_enabled:
+                add_disks_lso()
+            clustersetup = StorageClusterSetup()
+            create_lvs_resource(self.storage_class, self.storage_class)
+            if config.ENV_DATA.get("mark_masters_schedulable", False):
+                node.mark_masters_schedulable()
+            add_storage_label()
+            clustersetup.setup_storage_cluster()
+            storagecluster_health_check()
 
     def patch_catalogsource(self):
         """
@@ -245,6 +324,43 @@ def extract_image_digest_mirror_set():
     return filename
 
 
+def is_not_arbiter_node(node_obj):
+    """
+    Determines if a node contains the arbiter zone label.
+    Used to filter arbiter node from node list.
+
+    Args:
+        node_obj (ocs_ci.ocs.ocp.OCP): OCP Node object
+
+    Returns:
+        bool: True if node doesn't contain the labelj, False if it does
+
+    """
+    arbiter_zone = config.DEPLOYMENT.get(
+        "arbiter_zone", constants.ARBITER_ZONE_LABEL[0]
+    )
+    zone_key = "topology.kubernetes.io/zone"
+    data = node_obj.data
+    metadata = data.get("metadata")
+    labels = metadata.get("labels")
+    return not labels.get(zone_key) == arbiter_zone
+
+
+def add_storage_label():
+    """
+    Add storage label on nodes.
+    """
+    if config.ENV_DATA.get("mark_masters_schedulable", False):
+        all_nodes = node.get_all_nodes()
+        nodes = node.get_node_objs(all_nodes)
+        # Filter arbiter node if configured
+        if config.DEPLOYMENT.get("arbiter_deployment"):
+            nodes = list(filter(is_not_arbiter_node, nodes))
+    else:
+        nodes = node.get_nodes(node_type="worker")
+    node.label_nodes(nodes)
+
+
 @retry(CommandFailed, 12, 5, backoff=1)
 def run_patch_cmd(cmd):
     """
@@ -252,6 +368,56 @@ def run_patch_cmd(cmd):
     """
     out = run_cmd(cmd)
     assert "patched" in out
+
+
+@retry((AssertionError, KeyError), 20, 60, backoff=1)
+def storagecluster_health_check():
+    """
+    Ensure the StorageCluster (Ceph backend) is healthy and resilient.
+
+    Raises:
+        AssertionError: If the StorageCluster is not in a Ready state
+                        or Ceph health is not HEALTH_OK.
+        KeyError: If expected status keys are missing.
+    """
+    storagecluster = StorageCluster(
+        resource_name="ocs-storagecluster",
+        namespace="openshift-storage",
+    )
+
+    status = storagecluster.data.get("status", {})
+    phase = status.get("phase")
+
+    logger.info(f"StorageCluster phase: {phase}")
+
+    assert phase == "Ready", f"StorageCluster phase is not Ready (found: {phase})"
+
+    logger.info("StorageCluster is healthy and in Ready state.")
+
+
+def wait_for_storageclusters_crd():
+    """
+    Wait for the storageclusters CRD to exist.
+    """
+    logger.info("Waiting for the StorageClusters CRD to exist")
+
+    @retry((CommandFailed, AssertionError, KeyError), 30, 30, backoff=1)
+    def _wait_for_storageclusters_crd():
+        storageclusters_crd = CustomResourceDefinition(
+            resource_name="storageclusters.ocs.openshift.io",
+        )
+        status = storageclusters_crd.data.get("status", {})
+        conditions = status.get("conditions")
+        established_status_exists = False
+
+        for condition in conditions:
+            if condition.get("type") == "Established":
+                established_status_exists = True
+                assert condition.get("status") == "True"
+
+        assert established_status_exists
+
+    _wait_for_storageclusters_crd()
 
 
 class FusionServiceInstance(OCP):
@@ -265,4 +431,14 @@ class OdfCluster(OCP):
     def __init__(self, resource_name="", *args, **kwargs):
         super(OdfCluster, self).__init__(
             resource_name=resource_name, kind="OdfCluster", *args, **kwargs
+        )
+
+
+class CustomResourceDefinition(OCP):
+    def __init__(self, resource_name="", *args, **kwargs):
+        super(CustomResourceDefinition, self).__init__(
+            resource_name=resource_name,
+            kind="CustomResourceDefinition",
+            *args,
+            **kwargs,
         )

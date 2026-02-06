@@ -69,6 +69,8 @@ class Initializer(object):
         """
         framework.config.init_cluster_configs()
         load_config(args.conf)
+        # Updating resource_checker to False since it's not needed for FDF deployment
+        config.RUN["resource_checker"] = False
         logger.debug("Verifying cluster_name and cluster_path")
         cluster_name = args.cluster_name
         cluster_path = os.path.expanduser(args.cluster_path)
@@ -82,8 +84,28 @@ class Initializer(object):
                 config.ENV_DATA["cluster_name"] = get_cluster_name(cluster_path)
             except FileNotFoundError:
                 raise ClusterNameNotProvidedError()
+        else:
+            config.ENV_DATA["cluster_name"] = cluster_name
 
         config.REPORTING["report_path"] = args.report
+
+        if self.deployment_type == "fusion":
+            if args.fusion_version:
+                base_dir = os.path.join(constants.FRAMEWORK_CONF_DIR, "fusion_version")
+                version_file = f"fusion-{args.fusion_version}.yaml"
+                cfg_file = os.path.join(base_dir, version_file)
+                load_config([cfg_file])
+            if args.fusion_image_tag:
+                config.DEPLOYMENT["fusion_pre_release_image"] = args.fusion_image_tag
+
+        if self.deployment_type == "fdf":
+            if args.fdf_version:
+                base_dir = os.path.join(constants.FRAMEWORK_CONF_DIR, "fdf_version")
+                version_file = f"fdf-{args.fdf_version}.yaml"
+                cfg_file = os.path.join(base_dir, version_file)
+                load_config([cfg_file])
+            if args.fdf_image_tag:
+                config.DEPLOYMENT["fdf_image_tag"] = args.fdf_image_tag
 
     def init_cli(self, args: list) -> list:
         """
@@ -109,6 +131,25 @@ class Initializer(object):
         parser.add_argument(
             "--report", default=None, help="Filepath for generated junit report"
         )
+        # Fusion specific args
+        if self.deployment_type == "fusion":
+            parser.add_argument(
+                "--fusion-version", default=None, help="Version of Fusion to install"
+            )
+            parser.add_argument(
+                "--fusion-image-tag",
+                default=None,
+                help="Image tag of Fusion to install",
+            )
+        # FDF specific args
+        elif self.deployment_type == "fdf":
+            parser.add_argument(
+                "--fdf-version", default=None, help="Version of FDF to install"
+            )
+            parser.add_argument(
+                "--fdf-image-tag", default=None, help="Image tag of FDF to install"
+            )
+
         parsed_args, _ = parser.parse_known_args(args)
 
         return parsed_args
@@ -279,6 +320,7 @@ def create_junit_report(
             test_suite = TestSuite(suite_name)
             _suite_props = suite_props or {}
             _case_props = case_props or {}
+            exit_code = 0
 
             logger.debug(f"TestSuite Props: {_suite_props}")
             logger.debug(f"TestCase Props: {_case_props}")
@@ -294,22 +336,25 @@ def create_junit_report(
             except Exception as e:
                 logger.exception(e)
                 test_case.result = [Failure(e)]
+                exit_code = 1
+            finally:
+                add_post_deployment_props(test_suite)
 
-            add_post_deployment_props(test_suite)
+                test_suite.add_testcase(test_case)
+                xml = JUnitXml()
+                xml.add_testsuite(test_suite)
 
-            test_suite.add_testcase(test_case)
-            xml = JUnitXml()
-            xml.add_testsuite(test_suite)
+                if config.REPORTING.get("report_path"):
+                    filepath = config.REPORTING.get("report_path")
+                else:
+                    log_dir = os.path.expanduser(config.RUN["log_dir"])
+                    run_id = config.RUN["run_id"]
+                    filepath = os.path.join(log_dir, f"{case_name}_{run_id}.xml")
 
-            if config.REPORTING.get("report_path"):
-                filepath = config.REPORTING.get("report_path")
-            else:
-                log_dir = os.path.expanduser(config.RUN["log_dir"])
-                run_id = config.RUN["run_id"]
-                filepath = os.path.join(log_dir, f"{case_name}_{run_id}.xml")
+                logger.info(f"Writing report to {filepath}")
+                xml.write(filepath, pretty=True)
 
-            logger.info(f"Writing report to {filepath}")
-            xml.write(filepath, pretty=True)
+                return exit_code
 
         return wrapper
 
