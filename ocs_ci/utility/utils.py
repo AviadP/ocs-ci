@@ -922,11 +922,12 @@ def truncate_long_lines(output: str, max_line_length: int = 500) -> str:
     - Adds truncation marker in middle
 
     Args:
-        output: Command output to process
-        max_line_length: Maximum line length before truncation
+        output (str): Command output to process.
+        max_line_length (int): Maximum line length before truncation.
 
     Returns:
-        str: Output with long lines truncated
+        str: Output with long lines truncated.
+
     """
     if not output:
         return output
@@ -940,9 +941,10 @@ def truncate_long_lines(output: str, max_line_length: int = 500) -> str:
             prefix_len = max_line_length // 2
             suffix_len = 50
             truncated_chars = max(0, len(line) - prefix_len - suffix_len)
-            if truncated_chars > 0:
+            truncated_text = f"[...{truncated_chars} chars truncated...]"
+            if truncated_chars > len(truncated_text):
                 result.append(
-                    f"{line[:prefix_len]}[...{truncated_chars} chars truncated...]{line[-suffix_len:]}"
+                    f"{line[:prefix_len]}{truncated_text}{line[-suffix_len:]}"
                 )
             else:
                 result.append(line)  # Edge case: line just over threshold
