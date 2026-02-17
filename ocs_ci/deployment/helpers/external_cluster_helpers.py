@@ -675,14 +675,11 @@ class ExternalCluster(object):
             logger.error(f"Failed to disable certificate check. Error: {err}")
             raise ExternalClusterDisableCertificateCheckFailed
 
-    def enable_replica_one_pools(self) -> bool:
+    def enable_replica_one_pools(self) -> None:
         """
         Enable replica-1 pool support on the external Ceph cluster.
 
         Executes: ceph config set mon mon_allow_pool_size_one true
-
-        Returns:
-            bool: True if configuration was successful.
 
         Raises:
             ExternalClusterReplica1ConfigurationFailed: If configuration fails.
@@ -695,7 +692,6 @@ class ExternalCluster(object):
             exception_class=ExternalClusterReplica1ConfigurationFailed,
         )
         logger.info("Replica-1 pool support enabled successfully")
-        return True
 
     def create_zone_crush_rules(
         self, topology_config: TopologyReplica1Config
@@ -719,8 +715,12 @@ class ExternalCluster(object):
             raise ValueError("topology_config.zones cannot be empty")
 
         # Get existing CRUSH rules for idempotency check
-        retcode, out, _ = self.rhcs_conn.exec_cmd("ceph osd crush rule ls")
-        existing_rules = out.strip().split("\n") if retcode == 0 and out.strip() else []
+        _, out, _ = self.exec_external_ceph_cmd(
+            cmd="ceph osd crush rule ls",
+            error_msg="Failed to list existing CRUSH rules",
+            exception_class=ExternalClusterCrushRuleCreationFailed,
+        )
+        existing_rules = out.strip().split("\n") if out.strip() else []
         logger.debug(f"Existing CRUSH rules: {existing_rules}")
 
         created_rules = []
@@ -770,8 +770,12 @@ class ExternalCluster(object):
             raise ValueError("topology_config.zones cannot be empty")
 
         # Get existing pools for idempotency check
-        retcode, out, _ = self.rhcs_conn.exec_cmd("ceph osd pool ls")
-        existing_pools = out.strip().split("\n") if retcode == 0 and out.strip() else []
+        _, out, _ = self.exec_external_ceph_cmd(
+            cmd="ceph osd pool ls",
+            error_msg="Failed to list existing pools",
+            exception_class=ExternalClusterPoolCreationFailed,
+        )
+        existing_pools = out.strip().split("\n") if out.strip() else []
         logger.debug(f"Existing pools: {existing_pools}")
 
         created_pools = []
