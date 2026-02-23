@@ -22,10 +22,6 @@ from ocs_ci.deployment.helpers.external_cluster_helpers import (
 )
 from ocs_ci.ocs.exceptions import CommandFailed, ExternalClusterExporterRunFailed
 from ocs_ci.ocs.ocp import OCP
-from ocs_ci.ocs.replica_one import (
-    get_osd_kb_used_data,
-    get_osd_pgs_used,
-)
 
 log = logging.getLogger(__name__)
 
@@ -148,12 +144,6 @@ class TestReplicaOneExternal(ManageTest):
         """
         log.info("Starting external replica-1 setup test")
 
-        # Capture OSD state before setup
-        kb_before = get_osd_kb_used_data()
-        pgs_before = get_osd_pgs_used()
-        log.info(f"OSD KB used before setup: {kb_before}")
-        log.info(f"OSD PGs before setup: {pgs_before}")
-
         # Step 1-4: Setup replica-1 pools on Ceph cluster
         result = self.ext_cluster.setup_topology_replica_one(self.topology_config)
         self.created_pools = result["pools"]
@@ -188,11 +178,6 @@ class TestReplicaOneExternal(ManageTest):
             log.info(f"Applied configmaps: {self.created_configmaps}")
 
         except ExternalClusterExporterRunFailed as e:
-            log.warning(f"Exporter script failed (may not be available): {e}")
-            log.info("Continuing test without exporter resources")
-
-        # Capture OSD state after setup
-        pgs_after = get_osd_pgs_used()
-        log.info(f"OSD PGs after setup: {pgs_after}")
+            pytest.skip(f"Exporter script not available: {e}")
 
         log.info("External replica-1 setup test completed successfully")

@@ -90,6 +90,17 @@ class TopologyReplica1Config:
     pool_prefix: str = "rbd-zone"
     pg_num: int = 32
 
+    @property
+    def pool_names(self) -> list[str]:
+        return [
+            zone.pool_name or f"{self.pool_prefix}-{zone.zone_name}"
+            for zone in self.zones
+        ]
+
+    @property
+    def zone_names(self) -> list[str]:
+        return [zone.zone_name for zone in self.zones]
+
 
 class ExternalCluster(object):
     """
@@ -779,10 +790,7 @@ class ExternalCluster(object):
         logger.debug(f"Existing pools: {existing_pools}")
 
         created_pools = []
-        for zone in topology_config.zones:
-            pool_name = (
-                zone.pool_name or f"{topology_config.pool_prefix}-{zone.zone_name}"
-            )
+        for zone, pool_name in zip(topology_config.zones, topology_config.pool_names):
             rule_name = f"{zone.zone_name}-rule"
             pg_num = topology_config.pg_num
 
@@ -1017,12 +1025,8 @@ class ExternalCluster(object):
         if not topology_config.zones:
             raise ValueError("topology_config.zones cannot be empty")
 
-        # Build pool names list
-        pool_names = [
-            zone.pool_name or f"{topology_config.pool_prefix}-{zone.zone_name}"
-            for zone in topology_config.zones
-        ]
-        zone_names = [zone.zone_name for zone in topology_config.zones]
+        pool_names = topology_config.pool_names
+        zone_names = topology_config.zone_names
 
         # Build topology params
         topology_params = (
@@ -1054,7 +1058,7 @@ class ExternalCluster(object):
             )
 
     def apply_topology_export_resources(
-        self, resources: list[dict], namespace: str = None
+        self, resources: list[dict], namespace: str | None = None
     ) -> dict[str, list[str]]:
         """
         Apply exported topology resources (secrets, configmaps) to the cluster.
@@ -1082,7 +1086,6 @@ class ExternalCluster(object):
             data = resource.get("data", {})
 
             if kind == "Secret":
-                logger.info(f"Creating Secret: {name}")
                 secret_data = {
                     "apiVersion": "v1",
                     "kind": "Secret",
@@ -1096,7 +1099,6 @@ class ExternalCluster(object):
                 logger.info(f"Created Secret: {name}")
 
             elif kind == "ConfigMap":
-                logger.info(f"Creating ConfigMap: {name}")
                 configmap_data = {
                     "apiVersion": "v1",
                     "kind": "ConfigMap",
