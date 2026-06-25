@@ -225,8 +225,12 @@ class TestNodesRestart(ManageTest):
             # delete_resources() doesn't hang on a terminated kubelet
             worker_nodes = get_nodes(node_type=constants.WORKER_MACHINE)
             safe_node = next(
-                n.name for n in worker_nodes if n.name != provisioner_node_name
+                (n.name for n in worker_nodes if n.name != provisioner_node_name),
+                None,
             )
+            assert (
+                safe_node
+            ), f"No safe worker node found (all workers match {provisioner_node_name})"
             safe_pod_factory = partial(pod_factory, node_name=safe_node)
             self.sanity_helpers.create_resources(
                 pvc_factory, safe_pod_factory, bucket_factory, rgw_bucket_factory
@@ -341,8 +345,12 @@ class TestNodesRestart(ManageTest):
             # delete_resources() doesn't hang on a terminated kubelet
             worker_nodes = get_nodes(node_type=constants.WORKER_MACHINE)
             safe_node = next(
-                n.name for n in worker_nodes if n.name != operator_node_name
+                (n.name for n in worker_nodes if n.name != operator_node_name),
+                None,
             )
+            assert (
+                safe_node
+            ), f"No safe worker node found (all workers match {operator_node_name})"
             safe_pod_factory = partial(pod_factory, node_name=safe_node)
             self.sanity_helpers.create_resources(
                 pvc_factory, safe_pod_factory, bucket_factory, rgw_bucket_factory
