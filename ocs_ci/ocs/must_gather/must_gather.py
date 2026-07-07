@@ -61,6 +61,19 @@ class MustGather(object):
             dir_name=temp_folder, ocp=False, ocs_flags=ocs_flags, mg_options=mg_options
         )
         self.root = temp_folder + "_ocs_logs"
+        root_exists = os.path.isdir(self.root) if self.root else False
+        root_contents = []
+        if root_exists:
+            for dirpath, dirnames, filenames in os.walk(self.root):
+                for f in filenames:
+                    fp = os.path.join(dirpath, f)
+                    root_contents.append(
+                        f"{os.path.relpath(fp, self.root)} ({os.path.getsize(fp)}B)"
+                    )
+        logger.info(
+            f"collect_must_gather done: root={self.root}, "
+            f"exists={root_exists}, files={root_contents}"
+        )
 
     def search_file_path(self):
         """
@@ -307,9 +320,18 @@ class MustGather(object):
 
         """
         paths = []
+        tarball_size = (
+            os.path.getsize(tarball_path) if os.path.isfile(tarball_path) else -1
+        )
+        logger.info(f"_get_paths_from_tarball: {tarball_path} size={tarball_size}B")
         try:
             with tarfile.open(tarball_path, "r:*") as tar:
-                for member in tar.getmembers():
+                members = tar.getmembers()
+                logger.info(
+                    f"Tarball has {len(members)} members, "
+                    f"first 3: {[m.name for m in members[:3]]}"
+                )
+                for member in members:
                     # Add the member path (files and dirs)
                     paths.append(member.name)
                     # Ensure parent directory paths are included for substring
@@ -333,16 +355,34 @@ class MustGather(object):
 
         """
         self.full_paths = []
+        disk_count = 0
+        tarball_count = 0
+        tarballs_found = []
 
         for root_dir, dirs, files in os.walk(self.root):
             for name in files + dirs:
                 full_path = os.path.join(root_dir, name)
                 self.full_paths.append(full_path)
+                disk_count += 1
             # Collect paths from must-gather tarballs found under root
             for name in files:
                 if name.endswith(".tar.gz"):
                     tarball_path = os.path.join(root_dir, name)
-                    self.full_paths.extend(self._get_paths_from_tarball(tarball_path))
+                    tarballs_found.append(tarball_path)
+                    tarball_entries = self._get_paths_from_tarball(tarball_path)
+                    logger.info(
+                        f"Tarball {tarball_path}: {len(tarball_entries)} entries extracted"
+                    )
+                    self.full_paths.extend(tarball_entries)
+                    tarball_count += len(tarball_entries)
+
+        logger.info(
+            f"get_all_paths: root={self.root}, "
+            f"disk_entries={disk_count}, tarball_entries={tarball_count}, "
+            f"tarballs_found={tarballs_found}, "
+            f"total={len(self.full_paths)}, "
+            f"sample={self.full_paths[:5]}"
+        )
 
     def verify_paths_in_dir(self, paths):
         """
