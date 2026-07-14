@@ -6,9 +6,10 @@ while keeping full data available for actual use.
 """
 
 import logging
+
 import yaml
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 # Fields to filter: {ResourceKind: {path.to.parent: [fields_to_remove]}}
 VERBOSE_FIELDS: dict[str, dict[str, list[str]]] = {
@@ -62,6 +63,11 @@ def filter_verbose_yaml(yaml_str: str, min_size: int = MIN_SIZE_FOR_FILTERING) -
     else:
         _filter_item(data)
 
+    logger.debug(
+        "Filtered verbose YAML output: kind=%s, original_size=%d chars",
+        kind,
+        len(yaml_str),
+    )
     return _format_summary(data, len(yaml_str))
 
 
