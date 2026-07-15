@@ -48,7 +48,9 @@ def filter_verbose_yaml(yaml_str: str, min_size: int = MIN_SIZE_FOR_FILTERING) -
 
     # Check if this resource type should be filtered
     if kind == "List":
-        item_kinds = {item.get("kind", "") for item in data.get("items", [])}
+        items = data.get("items")
+        items = items if isinstance(items, list) else []
+        item_kinds = {item.get("kind", "") for item in items if isinstance(item, dict)}
         should_filter = any(k in VERBOSE_FIELDS for k in item_kinds)
     else:
         should_filter = kind in VERBOSE_FIELDS
@@ -58,8 +60,11 @@ def filter_verbose_yaml(yaml_str: str, min_size: int = MIN_SIZE_FOR_FILTERING) -
 
     # Apply filtering
     if kind == "List":
-        for item in data.get("items", []):
-            _filter_item(item)
+        items = data.get("items")
+        items = items if isinstance(items, list) else []
+        for item in items:
+            if isinstance(item, dict):
+                _filter_item(item)
     else:
         _filter_item(data)
 
@@ -111,10 +116,11 @@ def _format_summary(data: dict, original_size: int) -> str:
     kind = data.get("kind", "Unknown")
 
     if kind == "List":
-        items = data.get("items", [])
+        items = data.get("items")
+        items = items if isinstance(items, list) else []
         item_kinds: dict[str, int] = {}
         for item in items:
-            k = item.get("kind", "Unknown")
+            k = item.get("kind", "Unknown") if isinstance(item, dict) else "Unknown"
             item_kinds[k] = item_kinds.get(k, 0) + 1
 
         summary = ", ".join(f"{count} {k}" for k, count in item_kinds.items())
