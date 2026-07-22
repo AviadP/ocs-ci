@@ -73,7 +73,9 @@ def filter_verbose_yaml(yaml_str: str, min_size: int = MIN_SIZE_FOR_FILTERING) -
         kind,
         len(yaml_str),
     )
-    return _format_summary(data, len(yaml_str))
+    summary = _format_summary(data, len(yaml_str))
+    filtered_yaml = yaml.safe_dump(data, default_flow_style=False, sort_keys=False)
+    return f"{summary}\n{filtered_yaml}"
 
 
 def _filter_item(item: dict) -> None:
