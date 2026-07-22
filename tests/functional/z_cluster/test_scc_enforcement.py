@@ -93,7 +93,7 @@ class TestSCCEnforcement(ManageTest):
     # TODO: Confirm SCC values against final design doc before merge.
 
     @tier1
-    @polarion_id("OCS-XXXX")
+    @polarion_id("OCS-8070")
     def test_rook_ceph_daemons_scc(self):
         """
         Verify all Rook-Ceph daemon pods are pinned to rook-ceph SCC.
@@ -121,7 +121,7 @@ class TestSCCEnforcement(ManageTest):
         self._verify_components_scc(components, "Rook-Ceph")
 
     @tier1
-    @polarion_id("OCS-XXXX")
+    @polarion_id("OCS-8069")
     def test_csi_plugins_scc(self):
         """
         Verify all CSI plugin pods are pinned to rook-ceph SCC.
@@ -154,7 +154,7 @@ class TestSCCEnforcement(ManageTest):
         self._verify_components_scc(components, "CSI")
 
     @tier1
-    @polarion_id("OCS-XXXX")
+    @polarion_id("OCS-8071")
     def test_noobaa_scc(self):
         """
         Verify all NooBaa pods are pinned to their respective custom SCCs.
@@ -185,7 +185,7 @@ class TestSCCEnforcement(ManageTest):
         self._verify_components_scc(components, "NooBaa")
 
     @tier1
-    @polarion_id("OCS-XXXX")
+    @polarion_id("OCS-8068")
     def test_odf_operators_scc(self):
         """
         Verify all ODF operator pods are pinned to their expected SCCs.
@@ -220,7 +220,7 @@ class TestSCCEnforcement(ManageTest):
         self._verify_components_scc(components, "ODF operators")
 
     @tier1
-    @polarion_id("OCS-XXXX")
+    @polarion_id("OCS-8072")
     def test_blackbox_exporter_scc(self):
         """
         Verify blackbox exporter pod is pinned to odf-blackbox-scc.
@@ -238,7 +238,7 @@ class TestSCCEnforcement(ManageTest):
     # --- Standalone tests ---
 
     @tier1
-    @polarion_id("OCS-XXXX")
+    @polarion_id("OCS-8073")
     def test_blackbox_exporter_scc_no_multus(self):
         """
         Verify blackbox exporter pod has correct SCC on a non-Multus cluster.
@@ -291,7 +291,7 @@ class TestSCCEnforcement(ManageTest):
             )
 
     @tier2
-    @polarion_id("OCS-XXXX")
+    @polarion_id("OCS-8074")
     def test_daemonset_scc_annotation_every_node(self):
         """
         Verify DaemonSet-managed CSI pods carry the required-scc annotation
@@ -336,7 +336,7 @@ class TestSCCEnforcement(ManageTest):
                 )
 
     @tier2
-    @polarion_id("OCS-XXXX")
+    @polarion_id("OCS-8075")
     def test_cronjob_pods_carry_scc_annotation(self):
         """
         Verify CronJob-spawned pods carry the required-scc annotation.
@@ -390,7 +390,7 @@ class TestSCCEnforcement(ManageTest):
         )
 
     @tier1
-    @polarion_id("OCS-XXXX")
+    @polarion_id("OCS-8076")
     def test_full_cluster_scc_audit(self):
         """
         Safety-net audit: zero running pods in openshift-storage without
