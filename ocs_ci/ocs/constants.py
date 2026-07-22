@@ -350,6 +350,20 @@ SERVICE_ACCOUNT = "Serviceaccount"
 SCC = "SecurityContextConstraints"
 PRIVILEGED = "privileged"
 ANYUID = "anyuid"
+
+# SCC annotation keys (RHSTOR-8757)
+SCC_REQUIRED_ANNOTATION = "openshift.io/required-scc"
+SCC_ADMISSION_ANNOTATION = "openshift.io/scc"
+
+# SCC names used by ODF components
+SCC_RESTRICTED_V2 = "restricted-v2"
+SCC_ROOK_CEPH = "rook-ceph"
+SCC_NOOBAA_CORE = "noobaa-core"
+SCC_NOOBAA_DB = "noobaa-db"
+SCC_NOOBAA_ENDPOINT = "noobaa-endpoint"
+SCC_CEPH_CSI_OP = "ceph-csi-op-scc"
+SCC_ODF_BLACKBOX = "odf-blackbox-scc"
+
 OCSINITIALIZATION = "OCSInitialization"
 OCSINIT = "ocsinit"
 SUBSCRIPTION_WITH_ACM = "Subscription.operators.coreos.com"
