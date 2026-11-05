@@ -238,6 +238,7 @@ class TestSCCEnforcement(ManageTest):
         assert not errors, "SCC pinning failed:\n" + "\n".join(errors)
 
     @tier2
+    @polarion_id("OCS-8403")
     def test_devicefinder_scc_annotations(self):
         """Check SCC and management annotations when discovery is deployed."""
         namespace = config.ENV_DATA["cluster_namespace"]
@@ -278,6 +279,7 @@ class TestSCCEnforcement(ManageTest):
 
     @tier2
     @skipif_mcg_only
+    @polarion_id("OCS-8404")
     def test_blackbox_exporter_preserves_multus_annotations(self):
         """Check SCC and configured Multus annotations on blackbox pods."""
         namespace = config.ENV_DATA["cluster_namespace"]
@@ -381,6 +383,7 @@ class TestSCCEnforcement(ManageTest):
 
     @tier2
     @skipif_mcg_only
+    @polarion_id("OCS-8405")
     def test_csi_annotations_survive_reconciliation(self, request):
         """Check configured SCC/CNI annotations before and after CSI reconciliation.
 
@@ -494,6 +497,7 @@ class TestSCCEnforcement(ManageTest):
         assert not errors, "CSI annotation checks failed:\n" + "\n".join(errors)
 
     @tier2
+    @polarion_id("OCS-8406")
     def test_spoke_token_exchange_agent_scc(self):
         """Require the expected SCC on token exchange agents on DR spokes."""
         if (
@@ -529,7 +533,13 @@ class TestSCCEnforcement(ManageTest):
 
     @tier2
     @skipif_mcg_only
-    @pytest.mark.parametrize("job_prefix", ["ocs-extend-cluster", "ocs-osd-removal"])
+    @pytest.mark.parametrize(
+        "job_prefix",
+        [
+            pytest.param("ocs-extend-cluster", marks=polarion_id("OCS-8407")),
+            pytest.param("ocs-osd-removal", marks=polarion_id("OCS-8408")),
+        ],
+    )
     def test_job_pods_carry_scc_annotation(self, job_prefix):
         """Check explicitly selected Jobs and their pods, including completed pods.
 
@@ -712,6 +722,7 @@ class TestSCCEnforcement(ManageTest):
         logger.info("Verified SCC pinning for all %d active pods", len(all_pods))
 
     @tier2
+    @polarion_id("OCS-8409")
     def test_noobaa_core_scc_survives_respin(self):
         """Verify SCC pinning on a replacement NooBaa core pod."""
         namespace = config.ENV_DATA["cluster_namespace"]
@@ -778,6 +789,7 @@ class TestSCCEnforcement(ManageTest):
         assert not errors, "SCC pinning failed after respin:\n" + "\n".join(errors)
 
     @tier2
+    @polarion_id("OCS-8410")
     def test_pod_creation_rejects_nonexistent_scc(self, project_factory):
         """Reject a pod pinned to an SCC that does not exist."""
         project = project_factory()
